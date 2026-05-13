@@ -1,16 +1,22 @@
 # ZPackR — Zstd-Native Compressed Neural Network Training
 
+> **Warning — Experimental.**  ZPackR is in early development and not yet ready
+> for production use.  APIs and training dynamics are subject to change without
+> notice.  Expect breakage and iteration.
+
 Dual-dictionary architecture for adaptive weight compression.
 Frozen BERT base + zstd-compressed trainable delta.  The WeightDict
 learns to compress weight byte patterns — blocks it recognizes are
 automatically attenuated and pruned from VRAM.
+
+Early testing shows accuracy matching or exceeding full fine-tune on
+bert-base-uncased SST-2 and MNLI.
 
 Depends on [PackR](https://github.com/otherdrums/packr) (MIT) for
 FusedQuantizedAdam and the kernel loader.
 
 ```bash
 pip install zpackr
-pip install zstandard   # if needed
 ```
 ```
 
