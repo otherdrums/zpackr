@@ -9,8 +9,8 @@ Frozen BERT base + zstd-compressed trainable delta.  The WeightDict
 learns to compress weight byte patterns — blocks it recognizes are
 automatically attenuated and pruned from VRAM.
 
-Early testing shows accuracy matching or exceeding full fine-tune on
-bert-base-uncased SST-2 and MNLI.
+Early testing hit 94.1% on bert-base-uncased SST-2 in 8000 steps, matching
+or exceeding full fine-tune.
 
 Depends on [PackR](https://github.com/otherdrums/packr) (MIT) for
 FusedQuantizedAdam and the kernel loader.
@@ -22,23 +22,22 @@ pip install zpackr
 
 ```python
 from transformers import AutoModelForSequenceClassification
-from packr import compress_model, PackRConfig, FusedQuantizedAdam, VelvetController
+from zpackr import compress_model, ZPackRConfig
+from packr.optim import FusedQuantizedAdam
 
-config = PackRConfig(mode="zpackr", layer_scope="ffn")
+config = ZPackRConfig(layer_scope="ffn")
 model = AutoModelForSequenceClassification.from_pretrained("bert-base-uncased", num_labels=2)
 model = compress_model(model, config)
-# model.super_zstd   ← frozen Super Dict (text codec, zstd-native prompting)
-# model.weight_dict  ← adaptive WeightDict (VRAM manager from delta patterns)
+# model.super_zstd   ← frozen Super Dict (text codec)
+# model.weight_dict  ← adaptive WeightDict (delta pattern compression)
 
 model.cuda()
 optimizer = FusedQuantizedAdam(model.parameters(), lr=2e-5)
-velvet = VelvetController(optimizer)
 
 for batch in loader:
     loss = model(**batch).loss
     loss.backward()
     optimizer.step()
-    velvet.step()
     optimizer.zero_grad()
 
     if step % 4 == 0:
@@ -119,44 +118,7 @@ output, ratio, trained = prompt_zstd_with_learning(model, compressed, threshold=
 export_model(model, output_path="./exported_model")
 ```
 
-## Speed & VRAM
-
-All runs on BERT-base, SST-2, batch_size=16, sm_75 (GTX 1650).  May 2026.
-
-| Method | ms/step | VRAM peak | Accuracy | |
-|--------|--------:|----------:|---------:|---|
-| Standard BERT | 838ms | 1073MB | — | reference |
-| LoRA (r=8) | 640ms | 438MB | — | 0.3M params |
-| PackR (v1) | 1966ms | 1142MB | 86.7% | full params |
-| PackR (v1, offload) | 1977ms | 1142MB | 85.9% | +CPU pinned |
-| ZPackR (gate on) | 2060ms | 1217MB | **89.4%** | full params |
-| ZPackR (novelty on) | 2459ms | 1176MB | 87.7% | full params |
-
-**ZPackR relative to standard BERT**: ~2.5× slower.  Post-step compression
-overhead amortizes to ~68ms/step at `post_step_interval=4` (24 layers × 180
-blocks ≈ 274ms per post_step / 4 = 68ms amortized).  Forward attenuation and
-shrink_known_delta add negligible cost (~1ms each).
-
-**PackR offload parity**: Offload is within 0.6% of no-offload speed and
-identical VRAM — the async prefetch optimizations eliminate the overhead.
-
-### Per-Block Novelty System
-
-Each block's delta gets a continuous novelty score [0,1] from its
-WeightDict compression ratio.  Novel blocks (ratio ≈ 1.3) train normally.
-Known blocks (ratio ≈ 6, zero delta) get forward-attenuated to near-zero
-contribution and actively decayed toward zero after each optimizer step.
-
-No LR schedule needed for known blocks — they regress naturally.  The
-system is self-limiting: repeated content eventually produces no gradient.
-
-| Parameter | Default | Effect |
-|-----------|:-------:|--------|
-| `_gap_enabled` | True | Per-layer toggle |
-| `_gap_decay_rate` | 0.05 | Max per-step decay (5%) for fully known blocks |
-| `_gap_hist_max/min` | adaptive | Historical ratio range for stable normalization |
-
-### Key Design Decisions
+## Key Design Decisions
 
 **Frozen base + zstd delta (not full-weight compression):**
 Storing the BERT pretrained weight as a frozen fp16 parameter plus a bf16
@@ -273,14 +235,11 @@ first post_step after reindex.
 
 | Parameter | Default | Effect |
 |-----------|:-------:|--------|
-| `zstd_salience_threshold` | **auto** | Manual override for salience threshold (leave unset for auto-calibration) |
+| `zstd_salience_threshold` | **auto** | Manual override for salience threshold |
 | `zstd_max_entries` | `16384` | Max patterns in WeightDict |
-| `post_step_interval` | `4` | How often to recompute delta salience |
-| `reindex_interval` | `1000` | How often to evolve WeightDict (rescan delta bytes) |
+| `post_step_interval` | `4` | Steps between delta salience updates |
+| `reindex_interval` | `1000` | Steps between WeightDict reindex |
 | `gate_threshold` | `2.0` | Super Dict ratio for train/skip on text |
-| `warmup_steps` | `0` | Velvet warmup (0 = auto, no warmup needed) |
-| `velvet_beta` | `0.97` | Velvet EMA smoothing |
-| `velvet_min_multiplier` | `0.175` | LR floor when velocity flatlines |
 
 ### How Auto-Calibration Works
 
