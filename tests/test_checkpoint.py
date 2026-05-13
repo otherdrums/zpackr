@@ -4,7 +4,8 @@ import os
 import tempfile
 import torch
 import pytest
-from packr import PackRConfig, compress_model
+from zpackr.config import ZPackRConfig
+from zpackr.layer_patcher import compress_model
 from zpackr.checkpoint import save_zpackr_checkpoint, load_zpackr_checkpoint
 
 
@@ -15,7 +16,7 @@ class TestCheckpoint:
             torch.nn.Linear(64, 32, bias=False),
             torch.nn.Linear(32, 16, bias=False),
         )
-        config = PackRConfig(mode="zpackr", layer_scope="all")
+        config = ZPackRConfig(layer_scope="all")
         model = compress_model(model, config)
         if device.type == "cuda":
             model = model.cuda()
