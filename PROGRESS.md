@@ -58,3 +58,13 @@
 - shrink_known_delta / novelty tracking (post-hoc, fights forward attenuation)
 - Relative creep tracking (EMA, prev_ratio) — the delta IS the history
 - Super Dict as gate (word-length dependent, not model-knowledge dependent)
+- **Variance gating** (skip zstd if delta L2 unchanged >15%) — stale ratios degrade signal. Every block compressed every post_step now.
+
+## Removed Complexity (May 14)
+
+| Component | Reason |
+|-----------|--------|
+| `_prev_delta_l2` tracking | Only used for variance gating — removed |
+| Variance gating (15% L2 check) | Stale ratios → stale attenuation → signal degradation |
+| `_block_gaps` for variance reuse | No longer needed — always fresh compression |
+| `LZ4` dependency | Replaced by zstd for ratio signal |
