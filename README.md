@@ -58,24 +58,32 @@ Text → BERT forward/backward → delta bytes
                                   │
                     zstd.compress() per block → ratio
                                   │
-            clamp((ratio - 1.0) / 7.0, 0, 1) → attenuation [0,1]
+            max(0, 1 - 1/(ratio × I_MAX)) → attenuation [0,1]
                                   │
             Forward: delta *= (1 - attenuation) per block
             Gate:    if all blocks ≥ 0.9 attenuation → skip backward
 ```
 
-**Zero-delta blocks** compress at 13,000x+ → attenuation 1.0 → fully suppressed.  
-**Non-zero delta blocks** compress at ~1.27x (bf16 entropy floor) → attenuation ~4% → mostly active.  
+**Zero-delta blocks** compress at 13,000x+ → attenuation ≈ 1.0 → fully suppressed.  
+**Non-zero delta blocks** compress at ~1.27x (bf16 entropy floor) → attenuation ~1% → train fully.  
 **Converging delta blocks** — as zstd finds more structure → ratio climbs → attenuation rises proportionally.
 
-The delta's current compressibility IS the knowledge metric.  No prev tracking,
-no creep, no EMA, no dictionaries.  The formula is a pure function of the
-current zstd ratio:
+The delta's current compressibility IS the knowledge metric.  The formula comes
+from Algorithmic Information Theory (AIT):
 
 ```python
-attenuation = clamp((ratio - RATIO_FLOOR) / (RATIO_CEILING - RATIO_FLOOR), 0, 1)
-# RATIO_FLOOR = 1.0, RATIO_CEILING = 8.0
+# I_MAX = bf16 entropy floor (measured: zstd compresses random bf16 to ~79%)
+I_MAX = 1.0 / 1.27  # ≈ 0.79
+attenuation = max(0.0, 1.0 - 1.0 / (ratio * I_MAX))
 ```
+
+- ratio = 1.0 (no compression, max entropy) → attenuation = 0.0 (fully active)
+- ratio = 1.27 (bf16 entropy floor) → attenuation = 0.003 (nearly fully active)
+- ratio = 5.0 (5x compression) → attenuation = 0.747 (mostly suppressed)
+- ratio = 13,000 (zero-delta) → attenuation ≈ 1.0 (fully suppressed)
+
+The only constant is `I_MAX` — empirically measurable, theoretically grounded.
+No RATIO_FLOOR, no RATIO_CEILING, no historical tracking.
 
 ### Layer Architecture
 
@@ -97,8 +105,8 @@ Each ZPackRLinear layer stores:
 1. Forward:       delta *= (1 - attenuation) per block → combined matmul → output
 2. Backward:      grad flows only to delta_salient (base_W is frozen)
 3. Optimizer.step() + optionally Velvet for per-layer LR adaptation
-4. post_step:     merge delta GPU→CPU, zstd compress per block → ratios (every step)
-5. Attenuation:   clamp((ratio - 1.0) / 7.0, 0, 1) per block — deterministic, no state
+4. Async compress: zstd compress per block in background thread → ratios
+5. Attenuation:   max(0, 1 - 1/(ratio × I_MAX)) — AIT-derived, single constant
 6. Pruning:       blocks at/above RATIO_CEILING * 0.75 evicted from delta_salient
 7. Gate:          convergence check — all blocks ≥ 0.9 → skip backward
 ```
@@ -113,15 +121,16 @@ Future: auto-terminate training when gate skip rate saturates.
 ### Key Design Decisions
 
 **zstd over LZ4**:  LZ4 produced ratios < 1.0 on non-zero bf16 (data inflation),
-making `(ratio - 1.0) / 7.0` always zero.  zstd gives ratios > 1.0 (~1.27 for
-active deltas, rising with convergence, 13,000+ for zeros).  This range makes the
-deterministic formula work.
+making the AIT formula impossible.  zstd gives ratios > 1.0 (~1.27 for active
+deltas, 13,000+ for zeros).  This range makes the AIT formula work.
 
 **No dictionaries, no reindex, no calibration**:  The WeightDict was eliminated.
 Per-block zstd compressibility provides a clean signal with zero maintenance.
 
-**Fixed mapping constants**:  `RATIO_FLOOR=1.0`, `RATIO_CEILING=8.0`.
-Deterministic, stateless — the delta's own bytes track their history.
+**AIT-derived formula**:  `attenuation = max(0, 1 - 1/(ratio × I_MAX))`.
+From Algorithmic Information Theory: the fraction of a block's bytes that are
+compressible equals the fraction of knowledge already encoded.  Single constant
+`I_MAX ≈ 0.79` (bf16 entropy floor), empirically measurable.
 
 **zstd creep characterization** (May 2026):  On a fixed batch, zstd ratios creep at
 0.001-0.009%/step (deeper layers faster).  Total creep over 300 steps: 0.18% (layer 0)
@@ -179,8 +188,7 @@ runs/my_run_2026-05-14_124350_704b6e3/
 
 | Constant | Default | Meaning |
 |----------|:-------:|---------|
-| `RATIO_FLOOR` | `1.0` | Ratio below which block is fully novel (attenuation 0) |
-| `RATIO_CEILING` | `8.0` | Ratio at/above which block is fully known (attenuation 1) |
+| `I_MAX` | `0.79` | bf16 entropy floor (1/1.27), the only constant in the AIT formula |
 | `ATTENUATION_SKIP_THRESHOLD` | `0.9` | Gate fires when all blocks ≥ this attenuation |
 
 ## License

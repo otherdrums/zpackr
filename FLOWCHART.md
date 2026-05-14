@@ -110,9 +110,9 @@ STEP N (every step):
   │   post_step() — every step, zero lag:                         │
   │     sync delta GPU→CPU                                       │
   │     for each block:                                          │
-  │       if zero bytes → ratio=∞, attenuation=1.0 (fast path)   │
+  │       if L2 < 1e-4 → ratio=1.0, attenuation=0.0 (cold-start)│
   │       else → zstd.compress(bytes) → ratio                    │
-  │     attenuation = clamp((ratio - 1.0) / 7.0, 0, 1)          │
+  │     attenuation = max(0, 1 - 1/(ratio × I_MAX))              │
   │     if ratio >= 6.0 → prune                                  │
   └──────────────────────────────────────────────────────────────┘
 ```
@@ -127,7 +127,7 @@ FULL DELTA MATRIX [in_features × out_features] bf16
 │  Split into blocks of size BLOCK_SIZE (256)
 │
 ├── Block 0: rows [0:256]     × out_features  → 256*out*2 bytes
-│              ┌─ zero bytes? → ratio=∞, attenuation=1.0 (fast path)
+│              ┌─ L2 < 1e-4? → ratio=1.0, attenuation=0.0 (cold-start)
 │              └─ else → zstd.compress() → ratio
 │
 ├── Block 1: rows [256:512]   × out_features  → ...
@@ -139,7 +139,8 @@ FULL DELTA MATRIX [in_features × out_features] bf16
                     │
                     ▼
 
-    For each block i: attenuation[i] = clamp((ratio_i - 1.0) / 7.0, 0, 1)
+    For each block i: attenuation[i] = max(0, 1 - 1/(ratio_i × I_MAX))
+    I_MAX = 1/1.27 ≈ 0.79 (bf16 entropy floor)
 
                     │
                     ▼
@@ -235,9 +236,9 @@ A single block (256 × out_features) goes through these states:
 
 ```
                               ┌──────────────┐
-                    ┌────────▶│    ZERO      │ delta = 0
-                    │         │    DELTA     │ ratio ≈ 13,000+
-                    │         │              │ attenuation = 1.0
+                    ┌─────────│    ZERO      │ delta = 0
+                    │         │    DELTA     │ ratio ≈ 1.0 (L2 < 1e-4)
+                    │         │              │ attenuation = 0.0 (cold-start)
                     │         │   on GPU ✓   │
                     │         └──────┬───────┘
                     │                │ optimizer.step()
@@ -286,8 +287,8 @@ stateDiagram-v2
     PRUNED --> ZERO_DELTA : regrow (future)
     
     note right of ZERO_DELTA
-        ratio ≈ 13,000+
-        attenuation = 1.0
+        ratio ≈ 1.0 (L2 < 1e-4)
+        attenuation = 0.0
         on GPU
     end note
     
@@ -335,7 +336,8 @@ FULL DELTA MATRIX [in_features × out_features] bf16
                     │
                     ▼
 
-    For each block i: attenuation[i] = clamp((ratio_i - 1.0) / 7.0, 0, 1)
+    For each block i: attenuation[i] = max(0, 1 - 1/(ratio_i × I_MAX))
+    I_MAX = 1/1.27 ≈ 0.79 (bf16 entropy floor)
 
                     │
                     ▼
