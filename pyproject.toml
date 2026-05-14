@@ -5,11 +5,11 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "zpackr"
 version = "0.1.0"
-description = "ZPackR — zstd-native compressed neural network training with adaptive weight dictionaries"
+description = "ZPackR — LZ4-compressed delta training with per-block attenuation"
 license = {text = "MIT"}
 requires-python = ">=3.10"
 authors = [{name = "otherdrums"}]
-keywords = ["pytorch", "memory-efficient", "neural-network", "compression", "zstd"]
+keywords = ["pytorch", "memory-efficient", "neural-network", "compression", "lz4"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -24,7 +24,7 @@ classifiers = [
 
 dependencies = [
     "packr>=0.1.0",
-    "zstandard>=0.22",
+    "lz4",
     "torch>=2.0",
 ]
 

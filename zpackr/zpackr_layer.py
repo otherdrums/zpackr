@@ -1,50 +1,55 @@
-"""ZPackRLinear — dual-dict linear layer (ZPackR v2.0).
+"""ZPackRLinear — frozen base + LZ4-compressed trainable delta.
 
 Drop-in replacement for nn.Linear that stores a frozen base weight plus
-a zstd-compressed trainable delta.  Only salient blocks of the delta
-reside in VRAM.
+an LZ4-compressed trainable delta.  Only salient blocks reside in VRAM.
 
-Forward:  output = x @ W_combined  (single cuBLAS matmul)
-             └─ frozen ─┘        └─ trainable, zstd-compressed ─┘
+Forward:  output = x @ (base_W + delta * (1 - attenuation))
+             └─ frozen ─┘   └─ trainable, LZ4-compressed ─┘
 
-post_step() uses a self-calibrating per-layer threshold: the threshold
-ratchets up as the WeightDict learns to compress delta patterns better.
-Blocks that become more compressible than the current baseline are pruned.
+Per-block LZ4 compression ratios drive delta attenuation — blocks whose
+delta bytes compress well are attenuated, preventing overfitting at the
+block level.  No dictionaries, no reindex, no calibration.
 """
 
 import math
 import torch
 import torch.nn as nn
+import lz4.block
 
 
 BLOCK_SIZE = 256
 
+# Fixed deterministic attenuation mapping constants.
+# RATIO_FLOOR: below this, block is fully novel (attenuation = 0).
+# RATIO_CEILING: at/above this, block is fully known (attenuation = 1).
+RATIO_FLOOR = 1.0
+RATIO_CEILING = 8.0
+
+# Gate threshold: if ALL blocks across ALL layers have attenuation >= this,
+# the prompt is fully converged and backward can be skipped.
+ATTENUATION_SKIP_THRESHOLD = 0.9
+
 
 class ZPackRLinear(nn.Module):
-    """Linear layer with frozen base + zstd-compressed trainable delta.
+    """Linear layer with frozen base + LZ4-compressed trainable delta.
 
     CPU/pinned (authoritative):
         _full_delta:      torch.Tensor [in, out] bf16   full delta matrix
-        zstd_delta:       bytes                          compressed delta
+        _lz4_delta:       bytes                          LZ4-compressed delta
 
     GPU/VRAM:
-        base_W:           torch.Tensor [in, out] fp16    frozen pretrained weight
+        base_W:           torch.Tensor [in, out] bf16    frozen pretrained weight
         delta_salient:    torch.Tensor [kept*block, out] bf16  only kept blocks
         block_mask:       torch.Tensor bool[num_blocks]  which delta blocks in VRAM
         bias:             torch.Tensor [out] bf16 (optional)
-
-    Salience state:
-        _salient_count:   int  cached count of kept blocks (no GPU sync)
-        _salience_threshold: float | None  per-layer auto-calibrated threshold
     """
 
-    def __init__(self, in_features, out_features, weight_dict, bias=True):
+    def __init__(self, in_features, out_features, bias=True):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.block_size = BLOCK_SIZE
         self.num_blocks = math.ceil(in_features / self.block_size)
-        self.weight_dict = weight_dict
 
         # Frozen base — stored in bf16 for direct matmul compatibility
         self.base_W = nn.Parameter(
@@ -64,10 +69,9 @@ class ZPackRLinear(nn.Module):
         ) if bias else None
 
         self._full_delta = None       # [in, out] on CPU — authoritative delta
-        self._zstd_delta = None       # compressed delta bytes
+        self._lz4_delta = None       # LZ4-compressed delta bytes
         self._salient_count = self.num_blocks  # cached, updated in post_step
-        self._salience_threshold = None  # auto-calibrated on first post_step
-        self._calibration_max = None     # recorded at calibration time
+        self._salience_threshold = None  # pruning threshold (kept simple)
 
         # Cached kept-block indices (updated when mask changes)
         self._kept_indices = torch.arange(self.num_blocks, dtype=torch.long)
@@ -75,13 +79,10 @@ class ZPackRLinear(nn.Module):
         # Ratio cache for diagnostic tools — invalidated on post_step
         self._ratio_cache = None
 
-        # Per-block novelty system (ratio → novelty → attenuation + decay)
-        self._block_gaps = None                       # set on first post_step
-        self._novelty_scores = None                   # derived from gaps, clamped [0,1]
-        self._gap_hist_max = 1.0                      # historical max ratio (zero deltas)
-        self._gap_hist_min = 1.0                      # historical min ratio (trained)
-        self._gap_enabled = True                      # toggle per layer
-        self._gap_decay_rate = 0.01                   # 1% per step for fully known blocks
+        # Per-block attenuation factors [0,1], computed from fixed constants.
+        # 0.0 = fully active (novel), 1.0 = fully suppressed (known).
+        self._attenuation_factors = None
+        self._block_gaps = None  # cached per-block ratios
 
         # Delta tracking for incremental compression (skip unchanged blocks)
         self._prev_delta_l2 = [0.0] * self.num_blocks  # L2 norms from last post_step
@@ -121,11 +122,11 @@ class ZPackRLinear(nn.Module):
             delta = self.delta_salient
             if delta.device != dev:
                 delta = delta.to(device=dev, non_blocking=True)
-            if self._novelty_scores is not None and self._block_gaps is not None:
-                nv = torch.tensor(self._novelty_scores, device=dev,
+            if self._attenuation_factors is not None:
+                nv = torch.tensor(self._attenuation_factors, device=dev,
                                   dtype=torch.bfloat16)
                 nv = nv.repeat_interleave(self.block_size)[:self.in_features].unsqueeze(1)
-                W = self.base_W + delta * nv
+                W = self.base_W + delta * (1.0 - nv)
             else:
                 W = self.base_W + delta
             out = (x_bf16 @ W).float()
@@ -168,39 +169,33 @@ class ZPackRLinear(nn.Module):
         total_rows = min(K * BS, self.in_features)
         d_rows = delta_salient[:total_rows]
 
-        # Apply novelty attenuation to delta before scattering
-        if (self._novelty_scores is not None and self._block_gaps is not None):
+        # Apply attenuation to delta before scattering
+        if self._attenuation_factors is not None:
             nv_flat = torch.tensor(
-                [self._novelty_scores[blk] for blk in kept_idx.tolist()],
+                [self._attenuation_factors[blk] for blk in kept_idx.tolist()],
                 device=dev, dtype=torch.bfloat16
             )
             nv_broadcast = nv_flat.repeat_interleave(BS)[:total_rows].unsqueeze(1)
-            d_rows = d_rows * nv_broadcast
+            d_rows = d_rows * (1.0 - nv_broadcast)
 
         W.index_add_(0, self._scatter_indices, d_rows)
 
-    # ── post_step — delta salience update with auto-calibrating threshold ──
+    # ── post_step — delta salience update with deterministic attenuation ──
 
     @torch.no_grad()
     def post_step(self, threshold: float = None, calibration_multiplier: float = 0.01):
-        """Update delta salience.  Uses self-calibrating per-layer threshold.
+        """Update delta salience and attenuation factors.
 
-        On first call (or first after reindex): auto-calibrates threshold
-        at calibration_multiplier % of the maximum observed ratio.
-        Blocks must exceed this baseline to be pruned.
-
-        Skips calibration when all ratios are uniform (e.g., zero-delta).
+        Compresses each block's full delta bytes with LZ4, derives
+        attenuation from fixed constants (RATIO_FLOOR, RATIO_CEILING),
+        and updates the block mask for pruning.
         """
         self._sync_full_delta()
 
         delta_np = self._full_delta.view(torch.uint8).contiguous().view(-1).numpy()
         block_el_bytes = self.block_size * self.out_features * 2
-        # Sub-sample: only compress first 256KB of each block (ratio is homogenous)
-        sample_bytes = min(block_el_bytes, 256 * 1024)
         ratios = []
         cur_l2 = []
-        batch_bytes = []       # for bulk zstd
-        batch_indices = []     # which blocks need fresh compression
 
         for blk in range(self.num_blocks):
             byte_start = blk * block_el_bytes
@@ -221,52 +216,28 @@ class ZPackRLinear(nn.Module):
                 ratios.append(self._block_gaps[blk] if self._block_gaps else 1.0)
                 continue
 
-            blk_bytes = delta_np[byte_start:byte_start + sample_bytes].tobytes()
-            batch_bytes.append(blk_bytes)
-            batch_indices.append(blk)
-            ratios.append(0.0)  # placeholder, filled below
-
-        # Bulk zstd compression: all blocks in one C-level call (GIL released)
-        if batch_bytes and not self.weight_dict.is_empty:
-            batch_ratios = self.weight_dict.batch_ratios(batch_bytes)
-            for idx, ratio in zip(batch_indices, batch_ratios):
-                ratios[idx] = ratio
-        # Fill any remaining placeholders (unchanged blocks already have values)
-        for i in range(len(ratios)):
-            if ratios[i] == 0.0:
-                ratios[i] = 1.0
+            blk_bytes = delta_np[byte_start:byte_end].tobytes()
+            compressed = lz4.block.compress(blk_bytes, store_size=False)
+            ratio = len(blk_bytes) / max(len(compressed), 1)
+            ratios.append(ratio)
 
         self._prev_delta_l2 = cur_l2
 
-        # Per-block gaps = weight_ratio (higher = more compressible = known)
+        # Store ratios for future variance gating
         self._block_gaps = list(ratios)
-        self._compute_novelty()
-        # Auto-calibrate threshold on first post_step (or first after reindex).
-        # Strategy: find if there are two clusters (zero-delta vs trained-delta).
-        # When the max ratio ≥ 2x the min ratio, zero-delta blocks co-exist with
-        # trained blocks — set threshold in the gap.  Otherwise keep everything.
-        if self._salience_threshold is None and ratios:
-            if not self.weight_dict.is_empty:
-                cal_max = max(ratios)
-                cal_min = min(ratios)
-                gap_ratio = cal_max / max(cal_min, 1e-8)
-                if gap_ratio >= 2.0:  # Bimodal: zero-delta blocks present
-                    self._calibration_max = cal_max
-                    # Put threshold 30% up from trained baseline toward zero-delta peak
-                    self._salience_threshold = cal_min + (cal_max - cal_min) * 0.3
-            else:
-                self._salience_threshold = 0.0  # No dict → keep all
-            if threshold is not None:
-                self._salience_threshold = threshold
-            self._zstd_delta = None
-            self._ratio_cache = None
-            return  # No pruning on calibration pass (threshold set or deferred)
 
-        use_threshold = self._salience_threshold if self._salience_threshold is not None else (threshold or 1.4)
+        # Compute deterministic attenuation from fixed constants
+        span = RATIO_CEILING - RATIO_FLOOR
+        self._attenuation_factors = [
+            max(0.0, min(1.0, (r - RATIO_FLOOR) / span))
+            for r in ratios
+        ]
+
+        # Pruning: blocks at/above RATIO_CEILING are fully known → prune
+        use_threshold = threshold if threshold is not None else RATIO_CEILING * 0.75
 
         new_mask = torch.zeros(self.num_blocks, dtype=torch.bool)
         for blk in range(self.num_blocks):
-            # ratio < threshold → novel (low compressibility) → KEEP
             new_mask[blk] = ratios[blk] < use_threshold
 
         old_kept = self._salient_count
@@ -275,11 +246,7 @@ class ZPackRLinear(nn.Module):
         if self._salient_count != old_kept:
             self._rebuild_delta_salient()
 
-        # Don't ratchet — threshold stays at calibration baseline until next reindex.
-        # The calibration baseline captures the "learned" compressibility floor.
-        # Any block falling BELOW (less compressible = novel) is kept.
-
-        self._zstd_delta = None
+        self._lz4_delta = None
         self._ratio_cache = None
 
     @property
@@ -289,55 +256,6 @@ class ZPackRLinear(nn.Module):
     @property
     def salient_count(self) -> int:
         return self._salient_count
-
-    def _compute_novelty(self):
-        """Map _block_gaps → per-block novelty scores [0,1].
-
-        Uses historical max/min ratio range for stable normalization.
-        When zero-delta blocks exist (high ratio ≈ 6), novelties are
-        well-separated.  When all blocks are uniform, novelty is ≥ 0.5
-        for all (conservative — don't decay active blocks).
-
-        novelty = (gap_max_hist - ratio) / span, clamped [0,1].
-        Low ratio (compresses poorly = novel) → high novelty.
-        High ratio (compresses well = known) → low novelty.
-        """
-        if self._block_gaps is None:
-            return
-        gaps = self._block_gaps
-        gap_max = max(gaps)
-        gap_min = min(gaps)
-        # Track historical range for stable normalization
-        self._gap_hist_max = max(self._gap_hist_max, gap_max)
-        self._gap_hist_min = min(self._gap_hist_min, gap_min)
-        span = max(self._gap_hist_max - self._gap_hist_min, 0.1)
-        self._novelty_scores = [
-            max(0.0, min(1.0, (self._gap_hist_max - g) / span))
-            for g in gaps
-        ]
-
-    @torch.no_grad()
-    def shrink_known_delta(self):
-        """Decay known blocks toward zero, driven by novelty scores.
-
-        Called after optimizer.step() + zero_grad(), before next forward.
-        Known (novelty=0): shrinks by _gap_decay_rate each step.
-        Novel (novelty=1): no decay.
-        In-between: proportional decay.
-        """
-        if (not self._gap_enabled or self._block_gaps is None
-                or self._novelty_scores is None):
-            return
-        BS = self.block_size
-        kept_idx = self._kept_indices
-        for view_idx, blk in enumerate(kept_idx.tolist()):
-            novelty = self._novelty_scores[blk]
-            decay = (1.0 - novelty) * self._gap_decay_rate
-            if decay > 0:
-                vs = view_idx * BS
-                ve = vs + BS
-                rows = min(BS, self.in_features - int(blk) * BS)
-                self.delta_salient[vs:vs + rows] *= (1.0 - decay)
 
     @torch.no_grad()
     def stage_delta_async(self, stream):
@@ -376,25 +294,10 @@ class ZPackRLinear(nn.Module):
         self._staged_cpu = None
 
     def get_block_ratios(self):
-        """Return per-block compression ratios, delta L2 norms, and calibration state.
+        """Return per-block compression ratios, delta L2 norms, and attenuation.
 
         Called by diagnostic tools during post_step.  Cached until the next
         post_step (which invalidates via _ratio_cache = None).
-
-        When _block_gaps is available (post_step has run), returns cached
-        instance data without GPU→CPU sync.  Only recomputes from scratch
-        before the first post_step.
-
-        Returns:
-            dict with keys:
-                ratios:              list[float]  compression ratio per block
-                delta_l2:            list[float]  L2 norm of delta per block
-                block_gaps:          list[float]  same as ratios (cached)
-                novelty_scores:      list[float]  [0,1] per block
-                calibration_max:     float | None
-                calibrated_threshold: float | None
-                salient_count:       int
-                num_blocks:          int
         """
         if self._ratio_cache is not None:
             return self._ratio_cache
@@ -402,14 +305,14 @@ class ZPackRLinear(nn.Module):
         # Fast path: use cached post_step data, no GPU sync
         if self._block_gaps is not None:
             gaps = self._block_gaps
-            novelties = self._novelty_scores
-            if novelties is None:
-                gap_max = max(gaps)
-                gap_min = min(gaps)
-                span = max(gap_max - gap_min, 0.1)
-                novelties = [max(0.0, min(1.0, (gap_max - g) / span)) for g in gaps]
+            attenuations = self._attenuation_factors
+            if attenuations is None:
+                span = RATIO_CEILING - RATIO_FLOOR
+                attenuations = [
+                    max(0.0, min(1.0, (g - RATIO_FLOOR) / span))
+                    for g in gaps
+                ]
 
-            # delta_l2 from last _full_delta (may be stale between post_steps)
             delta_l2 = [0.0] * self.num_blocks
             if self._full_delta is not None:
                 for blk in range(self.num_blocks):
@@ -422,9 +325,7 @@ class ZPackRLinear(nn.Module):
                 'ratios': list(gaps),
                 'delta_l2': delta_l2,
                 'block_gaps': list(gaps),
-                'novelty_scores': novelties,
-                'calibration_max': self._calibration_max,
-                'calibrated_threshold': self._salience_threshold,
+                'attenuation_scores': attenuations,
                 'salient_count': self._salient_count,
                 'num_blocks': self.num_blocks,
             }
@@ -444,7 +345,8 @@ class ZPackRLinear(nn.Module):
             if byte_end <= byte_start:
                 continue
             blk_bytes = delta_np[byte_start:byte_end].tobytes()
-            ratio = self.weight_dict.ratio(blk_bytes) if not self.weight_dict.is_empty else 1.0
+            compressed = lz4.block.compress(blk_bytes, store_size=False)
+            ratio = len(blk_bytes) / max(len(compressed), 1)
             ratios[blk] = ratio
 
             fs = blk * self.block_size
@@ -452,17 +354,20 @@ class ZPackRLinear(nn.Module):
             if fe > fs:
                 delta_l2[blk] = self._full_delta[fs:fe, :].float().norm().item()
 
+        span = RATIO_CEILING - RATIO_FLOOR
+        attenuations = [
+            max(0.0, min(1.0, (r - RATIO_FLOOR) / span))
+            for r in ratios
+        ]
+
         self._ratio_cache = {
             'ratios': ratios,
             'delta_l2': delta_l2,
             'block_gaps': ratios,
-            'novelty_scores': [1.0] * self.num_blocks,
-            'calibration_max': self._calibration_max,
-            'calibrated_threshold': self._salience_threshold,
+            'attenuation_scores': attenuations,
             'salient_count': self._salient_count,
             'num_blocks': self.num_blocks,
         }
-        return self._ratio_cache
         return self._ratio_cache
 
     def _sync_full_delta(self):
@@ -522,29 +427,6 @@ class ZPackRLinear(nn.Module):
 
         self.delta_salient = nn.Parameter(new_view.to(device=device), requires_grad=True)
 
-    # ── Reindex ──
-
-    @torch.no_grad()
-    def reindex(self, min_frequency: float = 0.01, min_count: int = 10):
-        """Evolve WeightDict from delta patterns.
-
-        Resets the self-calibrating threshold — next post_step will
-        recalibrate against the updated dictionary.
-        """
-        if self._full_delta is None:
-            self._full_delta = self.delta_salient.cpu()
-        delta_bytes = self._full_delta.view(torch.uint8).contiguous().view(-1).numpy().tobytes()
-        result = self.weight_dict.reindex(delta_bytes, min_frequency=min_frequency, min_count=min_count)
-        self._salience_threshold = None  # Recalibrate on next post_step
-        self._calibration_max = None
-        self._block_gaps = None           # Recompute on next post_step
-        self._novelty_scores = None
-        self._gap_hist_max = 1.0          # Reset historical range
-        self._gap_hist_min = 1.0
-        self._prev_delta_l2 = [0.0] * self.num_blocks
-        self._ratio_cache = None
-        return result
-
     # ── Export ──
 
     @torch.no_grad()
@@ -561,10 +443,9 @@ class ZPackRLinear(nn.Module):
 
         self._sync_full_delta()
 
-        if self._zstd_delta is None and self._full_delta is not None:
-            self._zstd_delta = self.weight_dict.compress(
-                self._full_delta.view(torch.uint8).contiguous().view(-1).numpy().tobytes()
-            )
+        if self._lz4_delta is None and self._full_delta is not None:
+            raw = self._full_delta.view(torch.uint8).contiguous().view(-1).numpy().tobytes()
+            self._lz4_delta = lz4.block.compress(raw, store_size=False)
 
         torch.save({
             "in_features": self.in_features,
@@ -572,20 +453,18 @@ class ZPackRLinear(nn.Module):
             "block_size": self.block_size,
             "num_blocks": self.num_blocks,
             "has_bias": self.bias is not None,
-            "salience_threshold": self._salience_threshold,
         }, path + ".meta")
 
         torch.save(self.base_W.data, path + ".base_W")
 
-        if self._zstd_delta is not None:
-            with open(path + ".zstd", "wb") as f:
-                f.write(self._zstd_delta)
+        if self._lz4_delta is not None:
+            with open(path + ".lz4", "wb") as f:
+                f.write(self._lz4_delta)
 
         torch.save(self.block_mask, path + ".mask")
-        self.weight_dict.save(path + ".wd")
 
     @classmethod
-    def load_checkpoint(cls, path: str, weight_dict):
+    def load_checkpoint(cls, path: str):
         import os
 
         meta = torch.load(path + ".meta", weights_only=True)
@@ -596,16 +475,26 @@ class ZPackRLinear(nn.Module):
         inst.out_features = meta["out_features"]
         inst.block_size = meta["block_size"]
         inst.num_blocks = meta["num_blocks"]
-        inst.weight_dict = weight_dict
         inst.block_mask = torch.ones(inst.num_blocks, dtype=torch.bool)
-        inst._salience_threshold = meta.get("salience_threshold")
         inst._salient_count = inst.num_blocks
 
-        zstd_path = path + ".zstd"
-        if os.path.exists(zstd_path):
+        # Restore delta from LZ4-compressed bytes
+        lz4_path = path + ".lz4"
+        zstd_path = path + ".zstd"  # legacy support
+        if os.path.exists(lz4_path):
+            with open(lz4_path, "rb") as f:
+                compressed = f.read()
+            raw_size = inst.in_features * inst.out_features * 2
+            wb = lz4.block.decompress(compressed, uncompressed_size=raw_size)
+            inst._full_delta = torch.frombuffer(
+                bytearray(wb), dtype=torch.uint8
+            ).view(torch.bfloat16).view(inst.in_features, inst.out_features)
+        elif os.path.exists(zstd_path):
+            # Legacy zstd checkpoint support
+            import zstandard as zstd
+            dctx = zstd.ZstdDecompressor()
             with open(zstd_path, "rb") as f:
-                inst._zstd_delta = f.read()
-            wb = weight_dict.decompress(inst._zstd_delta)
+                wb = dctx.decompress(f.read())
             inst._full_delta = torch.frombuffer(
                 bytearray(wb), dtype=torch.uint8
             ).view(torch.bfloat16).view(inst.in_features, inst.out_features)
@@ -627,25 +516,20 @@ class ZPackRLinear(nn.Module):
         inst.bias = nn.Parameter(torch.zeros(inst.out_features, dtype=torch.bfloat16)) \
             if meta.get("has_bias", True) else None
         inst._scatter_indices = None
-        inst._novelty_scores = None
+        inst._attenuation_factors = None
         inst._block_gaps = None
-        inst._gap_hist_max = 1.0
-        inst._gap_hist_min = 1.0
-        inst._gap_enabled = True
-        inst._gap_decay_rate = 0.01
+        inst._lz4_delta = None
         inst._prev_delta_l2 = [0.0] * inst.num_blocks
         inst._delta_staging = None
         inst._ratio_cache = None
-        inst._calibration_max = None
-        inst._ratio_thread = None
         return inst
 
     # ── Conversion from nn.Linear ──
 
     @classmethod
-    def from_linear(cls, module: nn.Linear, weight_dict):
+    def from_linear(cls, module: nn.Linear):
         """Convert nn.Linear → frozen base + zero delta."""
-        inst = cls(module.in_features, module.out_features, weight_dict,
+        inst = cls(module.in_features, module.out_features,
                    bias=module.bias is not None)
 
         w = module.weight.detach().t().contiguous()
@@ -658,7 +542,6 @@ class ZPackRLinear(nn.Module):
         return inst
 
     def extra_repr(self):
-        thresh = f", threshold={self._salience_threshold:.3f}" if self._salience_threshold else ""
         return (f"in_features={self.in_features}, out_features={self.out_features}, "
-                f"delta_salient={self._salient_count}/{self.num_blocks} blocks{thresh}, "
+                f"delta_salient={self._salient_count}/{self.num_blocks} blocks, "
                 f"bias={self.bias is not None}")

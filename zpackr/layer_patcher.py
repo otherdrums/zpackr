@@ -4,15 +4,10 @@ import torch.nn as nn
 from packr.offload import OffloadManager
 from .zpackr_layer import ZPackRLinear
 from .config import ZPackRConfig
-from .super_dict import load_super_dict
-from .zstd_dict import WeightDict
 
 
 def compress_model(model: nn.Module, config: ZPackRConfig = None):
     """Replace nn.Linear layers with ZPackR-compressed equivalents.
-
-    Creates ZPackRLinear layers with frozen base + WeightDict-compressed delta.
-    Attaches model.super_zstd (SuperDict) and model.weight_dict (WeightDict).
 
     Returns:
         model: nn.Module with ZPackRLinear layers.
@@ -20,17 +15,13 @@ def compress_model(model: nn.Module, config: ZPackRConfig = None):
     if config is None:
         config = ZPackRConfig()
 
-    model.super_zstd = load_super_dict()
-    weight_dict = WeightDict(max_entries=config.zstd_max_entries)
-    model.weight_dict = weight_dict
-
     for name, module in list(model.named_modules()):
         if not isinstance(module, nn.Linear):
             continue
         if not _matches_scope(name, config.layer_scope):
             continue
 
-        zpackr = ZPackRLinear.from_linear(module, weight_dict)
+        zpackr = ZPackRLinear.from_linear(module)
         _replace_module(model, name, zpackr)
 
     if config.gradient_checkpointing:
@@ -41,7 +32,7 @@ def compress_model(model: nn.Module, config: ZPackRConfig = None):
             model.cuda()
         mgr = OffloadManager(prefetch_depth=1)
         zpackr_layers = [(n, m) for n, m in model.named_modules()
-                         if isinstance(m, ZPackRLinear)]
+                          if isinstance(m, ZPackRLinear)]
         for name, layer in zpackr_layers:
             mgr.register_wp(name, layer.base_W)
         model._offload_manager = mgr

@@ -1,7 +1,7 @@
-"""ZPackR — zstd-native compressed neural network training.
+"""ZPackR — LZ4-compressed delta training with per-block attenuation.
 
-Dual-dictionary architecture: frozen BERT base + WeightDict-compressed delta.
-Block-level zstd compression ratios serve as the convergence signal —
+Frozen BERT base + LZ4-compressed trainable delta.
+Per-block LZ4 compressibility directly attenuates delta in forward pass —
 no external LR scheduler needed.
 
 Usage:
@@ -11,21 +11,21 @@ Usage:
     # train normally — post_step() handles block-level attenuation
 """
 
-from .zpackr_layer import ZPackRLinear
-from .zstd_dict import WeightDict
+from .zpackr_layer import ZPackRLinear, BLOCK_SIZE, RATIO_FLOOR, RATIO_CEILING, ATTENUATION_SKIP_THRESHOLD
 from .config import ZPackRConfig
 from .layer_patcher import compress_model
-from .super_dict import load_super_dict, ZPackRSuperDict
-from .prompt_gate import should_train
-from .salience import compute_salience
+from .prompt_gate import should_skip_backward
+from .checkpoint import save_zpackr_checkpoint, load_zpackr_checkpoint
 
 __all__ = [
     "ZPackRLinear",
-    "WeightDict",
+    "BLOCK_SIZE",
+    "RATIO_FLOOR",
+    "RATIO_CEILING",
+    "ATTENUATION_SKIP_THRESHOLD",
     "ZPackRConfig",
     "compress_model",
-    "load_super_dict",
-    "ZPackRSuperDict",
-    "should_train",
-    "compute_salience",
+    "should_skip_backward",
+    "save_zpackr_checkpoint",
+    "load_zpackr_checkpoint",
 ]
