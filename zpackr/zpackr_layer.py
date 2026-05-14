@@ -86,9 +86,6 @@ class ZPackRLinear(nn.Module):
         self._attenuation_factors = None
         self._block_gaps = None  # cached per-block ratios
 
-        # Async GPU→CPU delta staging (populated by harness)
-        self._delta_staging = None   # GPU buffer for D2D copy (same shape as delta_salient)
-
         # Cached scatter indices for fused forward matmul
         self._scatter_indices = None  # pre-built for index_add_ in forward
 
@@ -101,6 +98,7 @@ class ZPackRLinear(nn.Module):
         """Compress delta blocks with zstd in a background thread.
 
         Called after stage_delta_async() snapshots the CPU delta.
+        Uses multi_compress_to_buffer for bulk C-level compression.
         Sets self._attenuation_pending when done.
         """
         if self._full_delta is None:
@@ -108,9 +106,13 @@ class ZPackRLinear(nn.Module):
                 self._attenuation_pending = None
             return
 
+        import numpy as np
         delta_np = self._full_delta.view(torch.uint8).contiguous().view(-1).numpy()
         block_el_bytes = self.block_size * self.out_features * 2
         ratios = []
+        cctx = zstd.ZstdCompressor(level=1)
+        batch_bytes = []
+        batch_indices = []
 
         for blk in range(self.num_blocks):
             byte_start = blk * block_el_bytes
@@ -119,15 +121,23 @@ class ZPackRLinear(nn.Module):
                 ratios.append(1.0)
                 continue
 
-            blk_bytes = delta_np[byte_start:byte_end].tobytes()
+            blk_arr = delta_np[byte_start:byte_end]
 
-            if blk_bytes == b'\x00' * len(blk_bytes):
+            # Fast zero check via numpy
+            if not np.any(blk_arr):
                 ratios.append(float('inf'))
                 continue
 
-            compressed = zstd.compress(blk_bytes)
-            ratio = len(blk_bytes) / max(len(compressed), 1)
-            ratios.append(ratio)
+            batch_bytes.append(blk_arr.tobytes())
+            batch_indices.append(blk)
+            ratios.append(0.0)  # placeholder
+
+        # Bulk compress all non-zero blocks in one C-level call
+        if batch_bytes:
+            results = cctx.multi_compress_to_buffer(batch_bytes)
+            for idx, blk_bytes, result in zip(batch_indices, batch_bytes, results):
+                clen = len(result.tobytes())
+                ratios[idx] = len(blk_bytes) / max(clen, 1)
 
         span = RATIO_CEILING - RATIO_FLOOR
         factors = [max(0.0, min(1.0, (r - RATIO_FLOOR) / span)) for r in ratios]
@@ -307,17 +317,13 @@ class ZPackRLinear(nn.Module):
         return self._salient_count
 
     @torch.no_grad()
-    def stage_delta_async(self, stream):
-        """D2D snapshot of delta_salient + launch async CPU copy on stream.
+    def stage_delta_async(self, stream=None):
+        """Snapshot delta_salient to CPU for background compression.
 
-        Called by harness after optimizer.step(), before next forward.
-        The CPU copy overlaps with the upcoming forward+backward on the GPU.
+        Stores a CPU copy in _staged_cpu for use by apply_staged_delta().
+        No GPU staging buffer needed — direct .cpu() call.
         """
-        if self._delta_staging is None or self._delta_staging.shape != self.delta_salient.shape:
-            self._delta_staging = torch.empty_like(self.delta_salient)
-        self._delta_staging.copy_(self.delta_salient)  # D2D, default stream
-        self._staged_cpu = self._delta_staging.to("cpu", non_blocking=False)  # sync D2H on default
-        # TODO: make D2H async on dedicated stream
+        self._staged_cpu = self.delta_salient.cpu()
 
     def apply_staged_delta(self):
         """Consume staged CPU delta data, merge into _full_delta.
@@ -566,7 +572,6 @@ class ZPackRLinear(nn.Module):
         inst._scatter_indices = None
         inst._attenuation_factors = None
         inst._zstd_delta = None
-        inst._delta_staging = None
         inst._ratio_cache = None
         return inst
 
