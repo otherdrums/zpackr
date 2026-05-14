@@ -1,14 +1,13 @@
-# ZPackR — LZ4-Compressed Delta Training with Per-Block Attenuation
+# ZPackR — Deterministic Per-Block Delta Attenuation
 
 > **Warning — Experimental.**  ZPackR is in early development and not yet ready
 > for production use.  APIs and training dynamics are subject to change without
 > notice.  Expect breakage and iteration.
 
-Frozen BERT base + LZ4-compressed trainable delta.  Per-block LZ4
+Frozen BERT base + zstd-compressed trainable delta.  Per-block zstd
 compressibility directly attenuates delta contribution in the forward
-pass — blocks the model already encodes are suppressed, making overfitting
-structurally impossible at the block level.  No learning rate schedules,
-no dictionaries, no reindex, no calibration.
+pass — the delta's current compressibility IS the knowledge metric.
+No dictionaries, no reindex, no calibration, no historical state.
 
 Early testing hit 94.1% on bert-base-uncased SST-2 in 8000 steps, matching
 or exceeding full fine-tune.
@@ -57,7 +56,7 @@ python -m tools.diagnose --task sst2 --max-steps 8000 --batch-size 16 \
 ```
 Text → BERT forward/backward → delta bytes
                                   │
-                    LZ4.block.compress() per block → ratio
+                    zstd.compress() per block → ratio
                                   │
             clamp((ratio - 1.0) / 7.0, 0, 1) → attenuation [0,1]
                                   │
@@ -65,12 +64,18 @@ Text → BERT forward/backward → delta bytes
             Gate:    if all blocks ≥ 0.9 attenuation → skip backward
 ```
 
-**Zero-delta blocks** compress extremely well (255x+) → attenuation 1.0 → fully suppressed.  
-**Non-zero delta blocks** are poorly compressible (~1.0x) → attenuation ~0 → train fully.
+**Zero-delta blocks** compress at 13,000x+ → attenuation 1.0 → fully suppressed.  
+**Non-zero delta blocks** compress at ~1.27x (bf16 entropy floor) → attenuation ~4% → mostly active.  
+**Converging delta blocks** — as zstd finds more structure → ratio climbs → attenuation rises proportionally.
 
-No external LR scheduler needed — the attenuation naturally prevents overfitting at
-the block level.  The convergence gate skips backward when the model has fully
-internalized a prompt, providing step-count-free training termination.
+The delta's current compressibility IS the knowledge metric.  No prev tracking,
+no creep, no EMA, no dictionaries.  The formula is a pure function of the
+current zstd ratio:
+
+```python
+attenuation = clamp((ratio - RATIO_FLOOR) / (RATIO_CEILING - RATIO_FLOOR), 0, 1)
+# RATIO_FLOOR = 1.0, RATIO_CEILING = 8.0
+```
 
 ### Layer Architecture
 
@@ -81,7 +86,7 @@ Each ZPackRLinear layer stores:
 | `base_W` | GPU | bf16 | No | Frozen BERT pretrained weight |
 | `delta_salient` | GPU | bf16 | **Yes** | Only kept (salient) delta blocks |
 | `_full_delta` | CPU | bf16 | — | Authoritative full delta matrix |
-| `_lz4_delta` | CPU | bytes | — | LZ4-compressed delta for checkpoint |
+| `_zstd_delta` | CPU | bytes | — | zstd-compressed delta for checkpoint |
 | `block_mask` | — | bool[N] | — | Which delta blocks are in VRAM |
 
 **Forward**: `output = x @ (base_W + delta * (1 - attenuation))` — single cuBLAS matmul.
@@ -92,40 +97,37 @@ Each ZPackRLinear layer stores:
 1. Forward:       delta *= (1 - attenuation) per block → combined matmul → output
 2. Backward:      grad flows only to delta_salient (base_W is frozen)
 3. Optimizer.step() + optionally Velvet for per-layer LR adaptation
-4. post_step (every N):  merge delta GPU→CPU, LZ4 compress per block → ratios
+4. post_step (every N):  merge delta GPU→CPU, zstd compress per block → ratios
 5. Attenuation:   clamp((ratio - 1.0) / 7.0, 0, 1) per block — deterministic, no state
 6. Pruning:       blocks at/above RATIO_CEILING * 0.75 evicted from delta_salient
-7. Gate:          convergence check — all blocks ≥ 0.9 → skip backward on next similar prompt
+7. Gate:          convergence check — all blocks ≥ 0.9 → skip backward
 ```
 
 ### Convergence Gate
 
-The convergence gate checks whether ALL blocks across ALL layers have attenuation ≥
-`ATTENUATION_SKIP_THRESHOLD` (default 0.9).  If so, backward is skipped for the
-current prompt — the model has no room to learn from it.
+Checks whether ALL blocks across ALL layers have attenuation ≥
+`ATTENUATION_SKIP_THRESHOLD` (default 0.9).  If so, backward is skipped.
 
-This enables future **self-terminating training**: when the gate skip rate reaches
-a threshold (e.g. 95%), training can stop automatically.  For now, step count
-limits are used for benchmark validation.
+Future: auto-terminate training when gate skip rate saturates.
 
 ### Key Design Decisions
 
-**LZ4 over zstd**:  Stateless byte-level compression.  No dictionary to build,
-evolve, or serialize.  LZ4 processes a 1.5 MB block in ~0.003 ms vs zstd's ~1-3 ms.
-The signal is clean: zero-delta → 255x ratio, non-zero delta → ~1.0x.
+**zstd over LZ4**:  LZ4 produced ratios < 1.0 on non-zero bf16 (data inflation),
+making `(ratio - 1.0) / 7.0` always zero.  zstd gives ratios > 1.0 (~1.27 for
+active deltas, rising with convergence, 13,000+ for zeros).  This range makes the
+deterministic formula work.
 
-**No dictionaries, no reindex**:  The WeightDict (zstd dictionary trained on delta
-bytes) was eliminated.  It required periodic reindex operations that blurred the
-signal — raw LZ4 gives sharper discrimination with zero maintenance.
+**No dictionaries, no reindex, no calibration**:  The WeightDict was eliminated.
+Per-block zstd compressibility provides a clean signal with zero maintenance.
 
-**Fixed attenuation constants**:  `RATIO_FLOOR=1.0`, `RATIO_CEILING=8.0`.
-Derived from ratio distribution analysis on SST-2.  No historical tracking,
-no calibration, no per-layer drift — the mapping is deterministic and stateless.
+**Fixed mapping constants**:  `RATIO_FLOOR=1.0`, `RATIO_CEILING=8.0`.
+Deterministic, stateless — the delta's own bytes track their history.
 
-**Delta domain only**:  The Super Dict (English text zstd dictionary) was removed
-from the training signal chain.  It remains available in the codebase as a text
-preprocessor for future use, but the learning signal comes purely from delta
-compressibility.
+**zstd creep characterization** (May 2026):  On a fixed batch, zstd ratios creep at
+0.001-0.009%/step (deeper layers faster).  Total creep over 300 steps: 0.18% (layer 0)
+to 1.37% (layer 11).  zstd noise floor is effectively zero (deterministic for same bytes).
+Signal is clean and persistent — no EMA or state tracking needed because the delta
+itself IS the history.
 
 ## Training Harness
 
@@ -141,7 +143,7 @@ python -m tools.diagnose --task sst2 --max-steps 8000 --batch-size 16 \
 | `--max-steps` | `2000` | Training steps |
 | `--eval-interval` | `500` | Steps between evals |
 | `--eval-steps` | `20` | Eval batches per run |
-| `--post-step-interval` | `4` | Steps between LZ4 ratio updates |
+| `--post-step-interval` | `4` | Steps between zstd ratio updates |
 | `--velvet` / `--no-velvet` | on | VelvetController per-layer LR |
 | `--attenuation-skip` / `--no-attenuation-skip` | on | Convergence gate |
 | `--attenuation-skip-threshold` | `0.9` | Attenuation threshold for gate |
@@ -154,14 +156,14 @@ python -m tools.diagnose --task sst2 --max-steps 8000 --batch-size 16 \
 ### Output Structure
 
 ```
-runs/my_run_2026-05-14_091241_5aded6d/
+runs/my_run_2026-05-14_124350_704b6e3/
   metrics.jsonl         # per-step: loss, step_ms, gate_skipped, salience, vram
   ratio_log.jsonl       # per-step per-block: ratio, attenuation, delta_l2
   config.json           # full TrainerConfig snapshot
   summary.json          # final stats: peak_vram_mb, final_eval_metric, gate_skip_rate
   checkpoints/
     step_2000/
-      0.meta, 0.lz4, 0.mask, 0.base_W   # per-layer delta state
+      0.meta, 0.zstd, 0.mask, 0.base_W   # per-layer delta state
       trainer_state.pt                    # optimizer + Velvet
 ```
 
@@ -169,13 +171,11 @@ runs/my_run_2026-05-14_091241_5aded6d/
 
 | Module | Purpose |
 |--------|---------|
-| `zpackr_layer.py` | ZPackRLinear — frozen base + LZ4 delta, forward matmul with attenuation |
+| `zpackr_layer.py` | ZPackRLinear — frozen base + zstd delta, forward matmul with attenuation |
 | `config.py` | ZPackRConfig dataclass |
 | `layer_patcher.py` | `compress_model()` — replaces nn.Linear with ZPackRLinear |
 | `prompt_gate.py` | `should_skip_backward()` — convergence-driven backward skip |
-| `checkpoint.py` | Model-level save/load with LZ4-compressed deltas |
-| `super_dict.py` | Optional text preprocessor (zstd dictionary for English) |
-| `zpackr_interface.py` | `export_model()` — merge base + delta back to nn.Linear |
+| `checkpoint.py` | Model-level save/load with zstd-compressed deltas |
 
 ## Tunables
 
@@ -184,7 +184,7 @@ runs/my_run_2026-05-14_091241_5aded6d/
 | `RATIO_FLOOR` | `1.0` | Ratio below which block is fully novel (attenuation 0) |
 | `RATIO_CEILING` | `8.0` | Ratio at/above which block is fully known (attenuation 1) |
 | `ATTENUATION_SKIP_THRESHOLD` | `0.9` | Gate fires when all blocks ≥ this attenuation |
-| `post_step_interval` | `4` | Steps between LZ4 ratio recomputation |
+| `post_step_interval` | `4` | Steps between zstd ratio recomputation |
 
 ## License
 
