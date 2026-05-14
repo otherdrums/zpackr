@@ -85,9 +85,6 @@ class ZPackRLinear(nn.Module):
         self._attenuation_factors = None
         self._block_gaps = None  # cached per-block ratios
 
-        # Delta tracking for incremental compression (skip unchanged blocks)
-        self._prev_delta_l2 = [0.0] * self.num_blocks  # L2 norms from last post_step
-
         # Async GPU→CPU delta staging (populated by harness)
         self._delta_staging = None   # GPU buffer for D2D copy (same shape as delta_salient)
 
@@ -187,7 +184,7 @@ class ZPackRLinear(nn.Module):
     def post_step(self, threshold: float = None, calibration_multiplier: float = 0.01):
         """Update delta salience and attenuation factors.
 
-        Compresses each block's full delta bytes with LZ4, derives
+        Compresses every block's full delta bytes with zstd, derives
         attenuation from fixed constants (RATIO_FLOOR, RATIO_CEILING),
         and updates the block mask for pruning.
         """
@@ -196,36 +193,18 @@ class ZPackRLinear(nn.Module):
         delta_np = self._full_delta.view(torch.uint8).contiguous().view(-1).numpy()
         block_el_bytes = self.block_size * self.out_features * 2
         ratios = []
-        cur_l2 = []
 
         for blk in range(self.num_blocks):
             byte_start = blk * block_el_bytes
             byte_end = min(byte_start + block_el_bytes, delta_np.nbytes)
             if byte_end <= byte_start:
                 ratios.append(1.0)
-                cur_l2.append(0.0)
-                continue
-
-            fs = blk * self.block_size
-            fe = min(fs + self.block_size, self.in_features)
-            l2 = self._full_delta[fs:fe, :].float().norm().item() if fe > fs else 0.0
-            cur_l2.append(l2)
-
-            # Delta variance gating: skip if block delta unchanged by >15%
-            prev = self._prev_delta_l2[blk]
-            if prev > 0 and abs(l2 - prev) / max(prev, 1e-8) < 0.15:
-                ratios.append(self._block_gaps[blk] if self._block_gaps else 1.0)
                 continue
 
             blk_bytes = delta_np[byte_start:byte_end].tobytes()
             compressed = zstd.compress(blk_bytes)
             ratio = len(blk_bytes) / max(len(compressed), 1)
             ratios.append(ratio)
-
-        self._prev_delta_l2 = cur_l2
-
-        # Store ratios for future variance gating
-        self._block_gaps = list(ratios)
 
         # Compute deterministic attenuation from fixed constants
         span = RATIO_CEILING - RATIO_FLOOR
@@ -517,9 +496,7 @@ class ZPackRLinear(nn.Module):
             if meta.get("has_bias", True) else None
         inst._scatter_indices = None
         inst._attenuation_factors = None
-        inst._block_gaps = None
         inst._zstd_delta = None
-        inst._prev_delta_l2 = [0.0] * inst.num_blocks
         inst._delta_staging = None
         inst._ratio_cache = None
         return inst
