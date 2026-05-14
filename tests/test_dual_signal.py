@@ -91,7 +91,7 @@ class TestLZ4Signal:
         )
 
     def test_post_step_produces_attenuation(self):
-        """post_step should produce attenuation factors from LZ4 ratios."""
+        """post_step should produce attenuation factors from zstd ratios."""
         torch.manual_seed(123)
         in_f, out_f = 64, 32
         lin = torch.nn.Linear(in_f, out_f, bias=False)
@@ -102,25 +102,26 @@ class TestLZ4Signal:
         assert zpl._attenuation_factors is not None, "post_step should compute attenuation"
         assert len(zpl._attenuation_factors) == zpl.num_blocks
 
-        # Zero delta → high ratio → high attenuation
+        # Zero delta → ratio=1.0 (below entropy floor) → attenuation=0.0
+        # AIT: untrained blocks have no knowledge → no attenuation
         for a in zpl._attenuation_factors:
-            assert a >= 0.9, (
-                f"Zero-delta should produce high attenuation, got {a:.3f}"
+            assert a <= 0.01, (
+                f"Zero-delta (untrained) should have no attenuation, got {a:.3f}"
             )
 
-    def test_convergence_gate_fires_on_zero_delta(self):
-        """When all blocks are fully attenuated, gate should fire."""
+    def test_convergence_gate_fires_on_converged_blocks(self):
+        """Gate should fire when all blocks have high attenuation (well-trained)."""
         torch.manual_seed(42)
-        in_f, out_f = 64, 32
-        lin = torch.nn.Linear(in_f, out_f, bias=False)
-        lin.weight.data = torch.randn(out_f, in_f)
+        lin = torch.nn.Linear(64, 32, bias=False)
         zpl = ZPackRLinear.from_linear(lin)
 
-        zpl.post_step()
+        # Simulate well-trained blocks with high attenuation
+        zpl._attenuation_factors = [0.95, 0.92, 0.91]
         layers = [("test", zpl)]
+        # Threshold 0.9: all blocks >= 0.9 → should fire
         result = should_skip_backward(layers, threshold=0.9)
         assert result, (
-            "Gate should fire when all blocks are fully attenuated (zero delta)"
+            "Gate should fire when all blocks are well-trained (high attenuation)"
         )
 
     def test_convergence_gate_does_not_fire_on_trained_blocks(self):

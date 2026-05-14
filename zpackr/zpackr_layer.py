@@ -27,6 +27,12 @@ BLOCK_SIZE = 256
 RATIO_FLOOR = 1.0
 RATIO_CEILING = 8.0
 
+# AIT-derived constant: bf16 entropy floor.
+# I_MAX = 1 / ratio_for_random_bf16
+# Measured: zstd compresses random bf16 to ~79% (ratio ~1.27).
+# Used in: attenuation = max(0, 1 - 1/(ratio * I_MAX))
+I_MAX = 1.0 / 1.27  # ≈ 0.7874
+
 # Gate threshold: if ALL blocks across ALL layers have attenuation >= this,
 # the prompt is fully converged and backward can be skipped.
 ATTENUATION_SKIP_THRESHOLD = 0.9
@@ -99,11 +105,12 @@ class ZPackRLinear(nn.Module):
 
         Called after stage_delta_async() snapshots the CPU delta.
         Uses multi_compress_to_buffer for bulk C-level compression.
-        Sets self._attenuation_pending when done.
+        Sets self._attenuation_pending and self._block_gaps when done.
         """
         if self._full_delta is None:
             with self._attenuation_lock:
                 self._attenuation_pending = None
+                self._block_gaps = None
             return
 
         import numpy as np
@@ -123,6 +130,13 @@ class ZPackRLinear(nn.Module):
 
             blk_arr = delta_np[byte_start:byte_end]
 
+            # Cold-start protection: near-zero delta → no attenuation
+            # ratio=1.0 gives attenuation=0 via AIT formula (below entropy floor)
+            l2 = float(np.sqrt(np.sum(blk_arr.astype(np.float32) ** 2)))
+            if l2 < 1e-4:
+                ratios.append(1.0)
+                continue
+
             # Fast zero check via numpy
             if not np.any(blk_arr):
                 ratios.append(float('inf'))
@@ -139,30 +153,40 @@ class ZPackRLinear(nn.Module):
                 clen = len(result.tobytes())
                 ratios[idx] = len(blk_bytes) / max(clen, 1)
 
-        span = RATIO_CEILING - RATIO_FLOOR
-        factors = [max(0.0, min(1.0, (r - RATIO_FLOOR) / span)) for r in ratios]
+        # AIT-derived attenuation: 1 - 1/(ratio * I_MAX)
+        # I_MAX = bf16 entropy floor (~0.79)
+        factors = [max(0.0, 1.0 - 1.0 / (r * I_MAX)) for r in ratios]
 
         with self._attenuation_lock:
             self._attenuation_pending = factors
+            self._block_gaps = ratios
 
     def swap_attenuation(self):
         """Swap in attenuation factors computed by background thread.
 
-        Called by harness after optimizer.step(), before next forward.
+        Called by harness before next forward.
         If pending factors are ready, they become active and pruning
-        is applied.
+        is applied based on the current ratios.
         """
         with self._attenuation_lock:
             if self._attenuation_pending is not None:
                 self._attenuation_factors = self._attenuation_pending
                 self._attenuation_pending = None
 
-                # Apply pruning based on current ratios
-                # (ratios not directly available here, but attenuation >= threshold
-                #  maps to blocks we know are fully attenuated)
-                # For now, keep all blocks — pruning based on ratio needs fresh data
+                # Pruning: blocks at/above RATIO_CEILING * 0.75 are fully known
+                if self._block_gaps is not None:
+                    use_threshold = RATIO_CEILING * 0.75
+                    new_mask = torch.zeros(self.num_blocks, dtype=torch.bool)
+                    for blk in range(self.num_blocks):
+                        new_mask[blk] = self._block_gaps[blk] < use_threshold
 
-        # If no pending, keep current attenuation (no change)
+                    old_kept = self._salient_count
+                    self.block_mask.copy_(new_mask)
+                    self._salient_count = int(new_mask.sum().item())
+                    if self._salient_count != old_kept:
+                        self._rebuild_delta_salient()
+
+                self._ratio_cache = None
 
     # ── Forward ──
 
@@ -276,19 +300,18 @@ class ZPackRLinear(nn.Module):
 
             blk_bytes = delta_np[byte_start:byte_end].tobytes()
 
-            # Zero-delta fast path: all-zero blocks compress perfectly
+            # Zero-delta fast path: all-zero blocks → ratio=1.0 (below entropy floor, no attenuation)
             if blk_bytes == b'\x00' * len(blk_bytes):
-                ratios.append(float('inf'))
+                ratios.append(1.0)
                 continue
 
             compressed = zstd.compress(blk_bytes)
             ratio = len(blk_bytes) / max(len(compressed), 1)
             ratios.append(ratio)
 
-        # Compute deterministic attenuation from fixed constants
-        span = RATIO_CEILING - RATIO_FLOOR
+        # AIT-derived attenuation: 1 - 1/(ratio * I_MAX)
         self._attenuation_factors = [
-            max(0.0, min(1.0, (r - RATIO_FLOOR) / span))
+            max(0.0, 1.0 - 1.0 / (r * I_MAX))
             for r in ratios
         ]
 
@@ -362,9 +385,8 @@ class ZPackRLinear(nn.Module):
             gaps = self._block_gaps
             attenuations = self._attenuation_factors
             if attenuations is None:
-                span = RATIO_CEILING - RATIO_FLOOR
                 attenuations = [
-                    max(0.0, min(1.0, (g - RATIO_FLOOR) / span))
+                    max(0.0, 1.0 - 1.0 / (g * I_MAX))
                     for g in gaps
                 ]
 
@@ -409,9 +431,8 @@ class ZPackRLinear(nn.Module):
             if fe > fs:
                 delta_l2[blk] = self._full_delta[fs:fe, :].float().norm().item()
 
-        span = RATIO_CEILING - RATIO_FLOOR
         attenuations = [
-            max(0.0, min(1.0, (r - RATIO_FLOOR) / span))
+            max(0.0, 1.0 - 1.0 / (r * I_MAX))
             for r in ratios
         ]
 
