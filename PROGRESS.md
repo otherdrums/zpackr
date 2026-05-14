@@ -1,5 +1,9 @@
 # ZPackR Progress Notes — May 2026
 
+## Reference
+
+- **System flowchart**: [FLOWCHART.md](FLOWCHART.md) — per-block lifecycle, signal chain, state machine
+
 ## Architecture Evolution
 
 | Version | Compressor | Signal | State | Status |
