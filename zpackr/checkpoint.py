@@ -42,7 +42,7 @@ def load_zpackr_checkpoint(model, path: str):
             module.delta_salient.data = restored.delta_salient.data
             module.block_mask.copy_(restored.block_mask)
             module._full_delta = restored._full_delta
-            module._lz4_delta = restored._lz4_delta
+            module._zstd_delta = restored._zstd_delta
             if module.bias is not None and restored.bias is not None:
                 module.bias.data = restored.bias.data
             layer_idx += 1

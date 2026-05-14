@@ -24,7 +24,7 @@ classifiers = [
 
 dependencies = [
     "packr>=0.1.0",
-    "lz4",
+    "zstandard>=0.22",
     "torch>=2.0",
 ]
 

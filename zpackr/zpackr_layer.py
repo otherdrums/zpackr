@@ -1,20 +1,21 @@
-"""ZPackRLinear — frozen base + LZ4-compressed trainable delta.
+"""ZPackRLinear — frozen base + zstd-compressed trainable delta.
 
 Drop-in replacement for nn.Linear that stores a frozen base weight plus
-an LZ4-compressed trainable delta.  Only salient blocks reside in VRAM.
+a zstd-compressed trainable delta.  Only salient blocks reside in VRAM.
 
 Forward:  output = x @ (base_W + delta * (1 - attenuation))
-             └─ frozen ─┘   └─ trainable, LZ4-compressed ─┘
+             └─ frozen ─┘   └─ trainable, zstd-compressed ─┘
 
-Per-block LZ4 compression ratios drive delta attenuation — blocks whose
+Per-block zstd compression ratios drive delta attenuation — blocks whose
 delta bytes compress well are attenuated, preventing overfitting at the
-block level.  No dictionaries, no reindex, no calibration.
+block level.  The delta's current compressibility IS the knowledge metric;
+no historical state, no dictionaries, no calibration.
 """
 
 import math
 import torch
 import torch.nn as nn
-import lz4.block
+import zstandard as zstd
 
 
 BLOCK_SIZE = 256
@@ -31,11 +32,11 @@ ATTENUATION_SKIP_THRESHOLD = 0.9
 
 
 class ZPackRLinear(nn.Module):
-    """Linear layer with frozen base + LZ4-compressed trainable delta.
+    """Linear layer with frozen base + zstd-compressed trainable delta.
 
     CPU/pinned (authoritative):
         _full_delta:      torch.Tensor [in, out] bf16   full delta matrix
-        _lz4_delta:       bytes                          LZ4-compressed delta
+        _zstd_delta:      bytes                          zstd-compressed delta
 
     GPU/VRAM:
         base_W:           torch.Tensor [in, out] bf16    frozen pretrained weight
@@ -69,7 +70,7 @@ class ZPackRLinear(nn.Module):
         ) if bias else None
 
         self._full_delta = None       # [in, out] on CPU — authoritative delta
-        self._lz4_delta = None       # LZ4-compressed delta bytes
+        self._zstd_delta = None       # zstd-compressed delta bytes (checkpoint)
         self._salient_count = self.num_blocks  # cached, updated in post_step
         self._salience_threshold = None  # pruning threshold (kept simple)
 
@@ -217,7 +218,7 @@ class ZPackRLinear(nn.Module):
                 continue
 
             blk_bytes = delta_np[byte_start:byte_end].tobytes()
-            compressed = lz4.block.compress(blk_bytes, store_size=False)
+            compressed = zstd.compress(blk_bytes)
             ratio = len(blk_bytes) / max(len(compressed), 1)
             ratios.append(ratio)
 
@@ -246,7 +247,7 @@ class ZPackRLinear(nn.Module):
         if self._salient_count != old_kept:
             self._rebuild_delta_salient()
 
-        self._lz4_delta = None
+        self._zstd_delta = None
         self._ratio_cache = None
 
     @property
@@ -345,7 +346,7 @@ class ZPackRLinear(nn.Module):
             if byte_end <= byte_start:
                 continue
             blk_bytes = delta_np[byte_start:byte_end].tobytes()
-            compressed = lz4.block.compress(blk_bytes, store_size=False)
+            compressed = zstd.compress(blk_bytes)
             ratio = len(blk_bytes) / max(len(compressed), 1)
             ratios[blk] = ratio
 
@@ -443,9 +444,9 @@ class ZPackRLinear(nn.Module):
 
         self._sync_full_delta()
 
-        if self._lz4_delta is None and self._full_delta is not None:
+        if self._zstd_delta is None and self._full_delta is not None:
             raw = self._full_delta.view(torch.uint8).contiguous().view(-1).numpy().tobytes()
-            self._lz4_delta = lz4.block.compress(raw, store_size=False)
+            self._zstd_delta = zstd.compress(raw)
 
         torch.save({
             "in_features": self.in_features,
@@ -457,9 +458,9 @@ class ZPackRLinear(nn.Module):
 
         torch.save(self.base_W.data, path + ".base_W")
 
-        if self._lz4_delta is not None:
-            with open(path + ".lz4", "wb") as f:
-                f.write(self._lz4_delta)
+        if self._zstd_delta is not None:
+            with open(path + ".zstd", "wb") as f:
+                f.write(self._zstd_delta)
 
         torch.save(self.block_mask, path + ".mask")
 
@@ -478,23 +479,22 @@ class ZPackRLinear(nn.Module):
         inst.block_mask = torch.ones(inst.num_blocks, dtype=torch.bool)
         inst._salient_count = inst.num_blocks
 
-        # Restore delta from LZ4-compressed bytes
-        lz4_path = path + ".lz4"
-        zstd_path = path + ".zstd"  # legacy support
-        if os.path.exists(lz4_path):
+        # Restore delta from zstd-compressed bytes
+        zstd_path = path + ".zstd"
+        lz4_path = path + ".lz4"  # legacy support
+        if os.path.exists(zstd_path):
+            with open(zstd_path, "rb") as f:
+                compressed = f.read()
+            wb = zstd.decompress(compressed)
+            inst._full_delta = torch.frombuffer(
+                bytearray(wb), dtype=torch.uint8
+            ).view(torch.bfloat16).view(inst.in_features, inst.out_features)
+        elif os.path.exists(lz4_path):
+            import lz4.block
             with open(lz4_path, "rb") as f:
                 compressed = f.read()
             raw_size = inst.in_features * inst.out_features * 2
             wb = lz4.block.decompress(compressed, uncompressed_size=raw_size)
-            inst._full_delta = torch.frombuffer(
-                bytearray(wb), dtype=torch.uint8
-            ).view(torch.bfloat16).view(inst.in_features, inst.out_features)
-        elif os.path.exists(zstd_path):
-            # Legacy zstd checkpoint support
-            import zstandard as zstd
-            dctx = zstd.ZstdDecompressor()
-            with open(zstd_path, "rb") as f:
-                wb = dctx.decompress(f.read())
             inst._full_delta = torch.frombuffer(
                 bytearray(wb), dtype=torch.uint8
             ).view(torch.bfloat16).view(inst.in_features, inst.out_features)
@@ -518,7 +518,7 @@ class ZPackRLinear(nn.Module):
         inst._scatter_indices = None
         inst._attenuation_factors = None
         inst._block_gaps = None
-        inst._lz4_delta = None
+        inst._zstd_delta = None
         inst._prev_delta_l2 = [0.0] * inst.num_blocks
         inst._delta_staging = None
         inst._ratio_cache = None

@@ -34,7 +34,7 @@ class TestLZ4Signal:
 
         # Zero delta → LZ4 should compress extremely well
         zpl._sync_full_delta()
-        import lz4.block
+        import zstandard as zstd
         import numpy as np
         delta_np = zpl._full_delta.view(torch.uint8).contiguous().view(-1).numpy()
         block_el_bytes = zpl.block_size * zpl.out_features * 2
@@ -43,7 +43,7 @@ class TestLZ4Signal:
             byte_start = blk * block_el_bytes
             byte_end = min(byte_start + block_el_bytes, delta_np.nbytes)
             blk_bytes = delta_np[byte_start:byte_end].tobytes()
-            compressed = lz4.block.compress(blk_bytes, store_size=False)
+            compressed = zstd.compress(blk_bytes)
             ratio = len(blk_bytes) / max(len(compressed), 1)
             assert ratio > 2.0, (
                 f"Zero-delta block {blk} should compress well, got ratio={ratio:.2f}"
@@ -70,9 +70,9 @@ class TestLZ4Signal:
                 zpl.delta_salient.data -= 0.01 * zpl.delta_salient.grad
             zpl.delta_salient.grad = None
 
-        # Trained delta → LZ4 should barely compress
+        # Trained delta → zstd should give ratio > 1.0 but < 2.0 (not highly compressible)
         zpl._sync_full_delta()
-        import lz4.block
+        import zstandard as zstd
         delta_np = zpl._full_delta.view(torch.uint8).contiguous().view(-1).numpy()
         block_el_bytes = zpl.block_size * zpl.out_features * 2
 
@@ -81,13 +81,13 @@ class TestLZ4Signal:
             byte_start = blk * block_el_bytes
             byte_end = min(byte_start + block_el_bytes, delta_np.nbytes)
             blk_bytes = delta_np[byte_start:byte_end].tobytes()
-            compressed = lz4.block.compress(blk_bytes, store_size=False)
+            compressed = zstd.compress(blk_bytes)
             ratio = len(blk_bytes) / max(len(compressed), 1)
-            if ratio < 1.5:
+            if ratio < 2.0:
                 found_low = True
                 break
         assert found_low, (
-            "At least one trained block should compress poorly (ratio < 1.5)"
+            "At least one trained block should have ratio < 2.0 (not highly compressible)"
         )
 
     def test_post_step_produces_attenuation(self):
@@ -171,5 +171,5 @@ class TestLZ4Signal:
         zpl = ZPackRLinear.from_linear(lin)
 
         assert not hasattr(zpl, 'weight_dict'), "weight_dict should be removed"
-        assert not hasattr(zpl, '_zstd_delta'), "_zstd_delta should be _lz4_delta"
-        assert hasattr(zpl, '_lz4_delta'), "_lz4_delta should exist"
+        assert hasattr(zpl, '_zstd_delta'), "_zstd_delta should exist"
+        assert not hasattr(zpl, '_lz4_delta'), "_lz4_delta should not exist"
