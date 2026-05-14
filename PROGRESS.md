@@ -64,18 +64,20 @@
 
 | Component | Reason |
 |-----------|--------|
-| `post_step_interval` config | post_step now runs every step — zero lag, instantaneous attenuation |
+| `post_step_interval` config | post_step replaced by async pipeline — zero lag, instantaneous attenuation |
 | `_prev_delta_l2` tracking | Only used for variance gating — removed |
 | Variance gating (15% L2 check) | Stale ratios → stale attenuation → signal degradation |
 | `_block_gaps` for variance reuse | No longer needed — always fresh compression |
 | `LZ4` dependency | Replaced by zstd for ratio signal |
+| `_delta_staging` GPU buffer | Direct .cpu() call saves 113MB VRAM |
+| `RATIO_FLOOR`, `RATIO_CEILING` | Replaced by AIT-derived formula (single constant I_MAX) |
 
 ## Determinism Status (May 14)
 
 Every component is a pure function of current state:
-- `post_step()`: delta bytes → zstd → ratio → `clamp((r-1)/7, 0, 1)` → attenuation
-- Zero-delta fast path: all-zero block → `ratio=∞` → `attenuation=1.0` (no zstd needed)
-- `forward()`: `delta *= (1 - attenuation)` — single cuBLAS matmul
-- `should_skip_backward()`: `all(attenuation >= 0.9)` — pure function
+- Attenuation: `max(0, 1 - 1/(ratio * I_MAX))` — AIT-derived, single constant
+- I_MAX = 1/1.27 ≈ 0.79 — bf16 entropy floor, measured once from signal data
+- Cold-start protection: L2 < 1e-4 → ratio=1.0 → attenuation=0.0 (no suppression for untrained blocks)
+- Gate: `all(attenuation >= threshold)` — pure function
 - Checkpoint: zstd compress/decompress — lossless roundtrip
 - DataLoader: `torch.manual_seed(seed)` — fixed shuffle order
