@@ -202,6 +202,12 @@ class ZPackRLinear(nn.Module):
                 continue
 
             blk_bytes = delta_np[byte_start:byte_end].tobytes()
+
+            # Zero-delta fast path: all-zero blocks compress perfectly
+            if blk_bytes == b'\x00' * len(blk_bytes):
+                ratios.append(float('inf'))
+                continue
+
             compressed = zstd.compress(blk_bytes)
             ratio = len(blk_bytes) / max(len(compressed), 1)
             ratios.append(ratio)

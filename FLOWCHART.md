@@ -18,11 +18,11 @@
                        │      ▼                                  │
                        │  optimizer.step()   ← FusedQuantizedAdam│
                        │      │                                  │
-                       │      ├─ every N steps: post_step()      │
+                       │      ├─ post_step()  every step         │
                        │      │    zstd.compress(block) → ratio  │
                        │      │    ratio → attenuation factors   │
                        │      │                                  │
-                       │      ├─ every step: convergence gate    │
+                       │      ├─ convergence gate               │
                        │      │    all blocks ≥ 0.9? → skip      │
                        │      │                                  │
                        │      └─ optimizer.zero_grad()            │
@@ -100,19 +100,55 @@ STEP N (every step):
                               │
                               ▼
   ┌──────────────────────────────────────────────────────────────┐
-  │ 4. OPTIMIZER                                                 │
+  │ 4. OPTIMIZER + ATTENUATION                                   │
   │                                                              │
   │   optimizer.step()                                           │
   │   → FusedQuantizedAdam updates delta_salient on GPU          │
   │   → (optional) VelvetController adjusts per-layer LRs         │
   │   → optimizer.zero_grad()                                    │
+  │                                                              │
+  │   post_step() — every step, zero lag:                         │
+  │     sync delta GPU→CPU                                       │
+  │     for each block:                                          │
+  │       if zero bytes → ratio=∞, attenuation=1.0 (fast path)   │
+  │       else → zstd.compress(bytes) → ratio                    │
+  │     attenuation = clamp((ratio - 1.0) / 7.0, 0, 1)          │
+  │     if ratio >= 6.0 → prune                                  │
   └──────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 3. post_step Detail (every post_step_interval steps)
+## 3. Signal Flow — Compression Chain (runs every step)
 
+```
+FULL DELTA MATRIX [in_features × out_features] bf16
+│
+│  Split into blocks of size BLOCK_SIZE (256)
+│
+├── Block 0: rows [0:256]     × out_features  → 256*out*2 bytes
+│              ┌─ zero bytes? → ratio=∞, attenuation=1.0 (fast path)
+│              └─ else → zstd.compress() → ratio
+│
+├── Block 1: rows [256:512]   × out_features  → ...
+│
+│   ... (num_blocks = ceil(in_features / 256))
+│
+└── Block N-1: rows [N*256:in] × out_features → ...
+
+                    │
+                    ▼
+
+    For each block i: attenuation[i] = clamp((ratio_i - 1.0) / 7.0, 0, 1)
+
+                    │
+                    ▼
+
+    FORWARD:  combined delta contribution = delta[i] * (1 - attenuation[i])
+              → applied per block in the cuBLAS matmul
+
+    GATE:     if all(attenuation[i] >= 0.9 for all i in all layers)
+              → should_skip_backward() = True
 ```
 STEP where step % post_step_interval == 0:
 ═══════════════════════════════════════════════════════════════════

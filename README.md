@@ -97,7 +97,7 @@ Each ZPackRLinear layer stores:
 1. Forward:       delta *= (1 - attenuation) per block → combined matmul → output
 2. Backward:      grad flows only to delta_salient (base_W is frozen)
 3. Optimizer.step() + optionally Velvet for per-layer LR adaptation
-4. post_step (every N):  merge delta GPU→CPU, zstd compress per block → ratios
+4. post_step:     merge delta GPU→CPU, zstd compress per block → ratios (every step)
 5. Attenuation:   clamp((ratio - 1.0) / 7.0, 0, 1) per block — deterministic, no state
 6. Pruning:       blocks at/above RATIO_CEILING * 0.75 evicted from delta_salient
 7. Gate:          convergence check — all blocks ≥ 0.9 → skip backward
@@ -133,8 +133,7 @@ itself IS the history.
 
 ```bash
 python -m tools.diagnose --task sst2 --max-steps 8000 --batch-size 16 \
-    --eval-interval 500 --post-step-interval 4 --no-velvet \
-    --label my_run
+    --eval-interval 500 --no-velvet --label my_run
 ```
 
 | Flag | Default | Description |
@@ -143,7 +142,6 @@ python -m tools.diagnose --task sst2 --max-steps 8000 --batch-size 16 \
 | `--max-steps` | `2000` | Training steps |
 | `--eval-interval` | `500` | Steps between evals |
 | `--eval-steps` | `20` | Eval batches per run |
-| `--post-step-interval` | `4` | Steps between zstd ratio updates |
 | `--velvet` / `--no-velvet` | on | VelvetController per-layer LR |
 | `--attenuation-skip` / `--no-attenuation-skip` | on | Convergence gate |
 | `--attenuation-skip-threshold` | `0.9` | Attenuation threshold for gate |
@@ -184,7 +182,6 @@ runs/my_run_2026-05-14_124350_704b6e3/
 | `RATIO_FLOOR` | `1.0` | Ratio below which block is fully novel (attenuation 0) |
 | `RATIO_CEILING` | `8.0` | Ratio at/above which block is fully known (attenuation 1) |
 | `ATTENUATION_SKIP_THRESHOLD` | `0.9` | Gate fires when all blocks ≥ this attenuation |
-| `post_step_interval` | `4` | Steps between zstd ratio recomputation |
 
 ## License
 
