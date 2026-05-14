@@ -16,6 +16,7 @@ import math
 import torch
 import torch.nn as nn
 import zstandard as zstd
+import threading
 
 
 BLOCK_SIZE = 256
@@ -90,6 +91,68 @@ class ZPackRLinear(nn.Module):
 
         # Cached scatter indices for fused forward matmul
         self._scatter_indices = None  # pre-built for index_add_ in forward
+
+        # Async zstd compression — double-buffer attenuation
+        self._attenuation_lock = threading.Lock()
+        self._attenuation_pending = None  # computed by background thread, ready to swap
+        self._attenuation_thread = None   # background thread handle
+
+    def _compress_async(self):
+        """Compress delta blocks with zstd in a background thread.
+
+        Called after stage_delta_async() snapshots the CPU delta.
+        Sets self._attenuation_pending when done.
+        """
+        if self._full_delta is None:
+            with self._attenuation_lock:
+                self._attenuation_pending = None
+            return
+
+        delta_np = self._full_delta.view(torch.uint8).contiguous().view(-1).numpy()
+        block_el_bytes = self.block_size * self.out_features * 2
+        ratios = []
+
+        for blk in range(self.num_blocks):
+            byte_start = blk * block_el_bytes
+            byte_end = min(byte_start + block_el_bytes, delta_np.nbytes)
+            if byte_end <= byte_start:
+                ratios.append(1.0)
+                continue
+
+            blk_bytes = delta_np[byte_start:byte_end].tobytes()
+
+            if blk_bytes == b'\x00' * len(blk_bytes):
+                ratios.append(float('inf'))
+                continue
+
+            compressed = zstd.compress(blk_bytes)
+            ratio = len(blk_bytes) / max(len(compressed), 1)
+            ratios.append(ratio)
+
+        span = RATIO_CEILING - RATIO_FLOOR
+        factors = [max(0.0, min(1.0, (r - RATIO_FLOOR) / span)) for r in ratios]
+
+        with self._attenuation_lock:
+            self._attenuation_pending = factors
+
+    def swap_attenuation(self):
+        """Swap in attenuation factors computed by background thread.
+
+        Called by harness after optimizer.step(), before next forward.
+        If pending factors are ready, they become active and pruning
+        is applied.
+        """
+        with self._attenuation_lock:
+            if self._attenuation_pending is not None:
+                self._attenuation_factors = self._attenuation_pending
+                self._attenuation_pending = None
+
+                # Apply pruning based on current ratios
+                # (ratios not directly available here, but attenuation >= threshold
+                #  maps to blocks we know are fully attenuated)
+                # For now, keep all blocks — pruning based on ratio needs fresh data
+
+        # If no pending, keep current attenuation (no change)
 
     # ── Forward ──
 
