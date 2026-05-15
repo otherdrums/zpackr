@@ -187,10 +187,11 @@ runs/my_run_2026-05-14_runid/
 
 | Constant | Default | Meaning |
 |----------|:-------:|---------|
-| `K` (lsh_K) | `64` | LSH hash bits (higher = finer resolution, more memory) |
-| `WINDOW_SIZE` | `60` | Sliding window of hash snapshots |
-| `LSH_OFFSETS` | `(1,5,10,25,50)` | Multi-scale comparison offsets |
+| `K` (lsh_K) | `128` | LSH hash bits (higher = finer resolution, more memory) |
+| `WINDOW_SIZE` | `1100` | Sliding window of hash snapshots |
+| `LSH_OFFSETS` | `(1,3,10,30,100,300,1000)` | Log-spaced multi-scale comparison offsets (3x spacing) |
 | `ATTENUATION_SKIP_THRESHOLD` | `1.0` | Gate fires when all rows ≥ this (min over rows) |
+| Attenuation formula | `squared` | `(mean_sim * (1 - flatness))²` — compresses distribution |
 
 ## License
 

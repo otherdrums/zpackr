@@ -34,8 +34,8 @@ BLOCK_SIZE = 256
 # the prompt is fully converged and backward can be skipped.
 ATTENUATION_SKIP_THRESHOLD = 1.0
 
-# Multi-scale comparison offsets (in steps)
-LSH_OFFSETS = (1, 5, 10, 25, 50)
+# Multi-scale comparison offsets (in steps) — logarithmic, 3x spacing
+LSH_OFFSETS = (1, 3, 10, 30, 100, 300, 1000)
 
 
 @triton.jit
@@ -82,7 +82,7 @@ class DeltaSignatureDB:
 
     _projection_cache: dict = {}  # class-level: (K, out_features) → float32 GPU tensor
 
-    def __init__(self, num_rows: int, K: int = 64, window_size: int = 60, seed: int = 42):
+    def __init__(self, num_rows: int, K: int = 128, window_size: int = 1100, seed: int = 42):
         self.K = K
         self.num_rows = num_rows
         self._window_size = window_size
@@ -124,7 +124,7 @@ class DeltaSignatureDB:
         if delta.device.type == 'cpu':
             proj = proj.cpu()
             result = delta.float() @ proj.t()
-            return (result > 0).to(torch.uint8)
+            return (result > 0).to(torch.uint8).cuda()
 
         hash_out = torch.empty(in_f, self.K, dtype=torch.uint8, device='cuda')
         grid = (in_f, self.K)
@@ -175,17 +175,8 @@ class DeltaSignatureDB:
         variance = self._sim_sqs / n_offsets - mean_sim * mean_sim
         flatness = torch.sqrt(torch.clamp(variance, min=0.0))
 
-        attenuation = mean_sim * (1.0 - flatness)
-        return torch.clamp(attenuation, 0.0, 1.0)
-
-        if n_offsets == 0:
-            return torch.zeros(self.num_rows, device=dev)
-
-        mean_sim = sim_sum / n_offsets
-        variance = sim_sqs / n_offsets - mean_sim * mean_sim
-        flatness = torch.sqrt(torch.clamp(variance, min=0.0))
-
-        attenuation = mean_sim * (1.0 - flatness)
+        # Squared attenuation: compresses distribution, delays convergence to 255
+        attenuation = (mean_sim * (1.0 - flatness)) ** 2
         return torch.clamp(attenuation, 0.0, 1.0)
 
 
@@ -199,7 +190,7 @@ class ZPackRLinear(nn.Module):
         bias:             torch.Tensor [out] bf16 (optional)
     """
 
-    def __init__(self, in_features, out_features, bias=True, lsh_K=64, lsh_window=60):
+    def __init__(self, in_features, out_features, bias=True, lsh_K=128, lsh_window=1100):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
