@@ -29,7 +29,7 @@ BLOCK_SIZE = 256
 
 # Gate threshold: if ALL blocks across ALL layers have attenuation >= this,
 # the prompt is fully converged and backward can be skipped.
-ATTENUATION_SKIP_THRESHOLD = 0.99
+ATTENUATION_SKIP_THRESHOLD = 1.0
 
 # Multi-scale comparison offsets (in steps)
 LSH_OFFSETS = (1, 5, 10, 25, 50)
@@ -51,7 +51,7 @@ class DeltaSignatureDB:
     _projection_cache: dict = {}  # class-level: (K, block_elements) → bf16 GPU tensor
 
     def __init__(self, block_elements: int, num_blocks: int,
-                 K: int = 128, window_size: int = 60, seed: int = 42):
+                 K: int = 64, window_size: int = 60, seed: int = 42):
         """
         Args:
             block_elements: number of bf16 elements per block (block_size * out_features)
@@ -156,7 +156,7 @@ class ZPackRLinear(nn.Module):
         bias:             torch.Tensor [out] bf16 (optional)
     """
 
-    def __init__(self, in_features, out_features, bias=True, lsh_K=128, lsh_window=60):
+    def __init__(self, in_features, out_features, bias=True, lsh_K=64, lsh_window=60):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
