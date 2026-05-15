@@ -12,7 +12,8 @@
 | v2 (LZ4, May 13) | LZ4 per-block | CPU | None | **Superseded** — ratios < 1.0 |
 | v3 (zstd, May 14) | zstd per-block | CPU background thread | None | **Superseded** — entropy floor |
 | v4 (LSH, May 14-15) | LSH multi-scale sliding window | GPU synchronous (~1ms) | Per-block ring buffer (60 steps) | **Superseded** — block-level caps accuracy |
-| v5 (Row LSH, May 15) | Per-row LSH + Triton kernel + uint8 + log-spaced offsets | GPU Triton kernel (K=32) | Per-row ring buffer (1100 steps) | **Current** |
+| v5 (Row LSH, May 15) | Per-row LSH + Triton kernel + uint8 + log-spaced offsets | GPU Triton kernel (K=32) | Per-row ring buffer (1100 steps) | **Superseded** |
+| v6 (CPU Window, May 15) | CPU-pinned window + batched GPU compute + optional bf16 | GPU Triton kernel (K=16) | Per-row CPU ring buffer (4200 steps) | **Current** |
 
 ## Key Findings
 
@@ -39,10 +40,27 @@
 - No CPU matmul (7.2 GFLOPS/step eliminated)
 - No background thread, no threading complexity
 
-### 5. Per-block variation is real
+### 6. Continuous byte comparison fixes dead signal
+- v5 with K=32 + binary byte match + squared formula produced attenation stuck at 0.0 for 3500 steps
+- K=32 packed into 4 bytes + binary match → 5 similarity levels/offset
+- K=16 packed into 2 bytes + continuous byte comparison `1 - |diff|/255` → ~512 levels/offset
+- Fix: switch to continuous byte comparison — signal alive from step 1
+
+### 7. GPU window is the largest VRAM consumer
+- GPU window (4200 × 46080 × 2 uint8) = 369MB — biggest single chunk
+- CPU-pinned window saves 369MB GPU VRAM at cost of ~644KB/step transfer (~40μs)
+- Async `copy_(non_blocking=True)` in push — data arrives before next compute_attenuation
+
+### 8. Model loaded in fp32 wastes ~100MB
+- HuggingFace default loads in fp32; attention/embedding/pooler layers stay fp32
+- With `--bf16` flag, entire model converts to bfloat16 — saves ~100MB, no quality impact
+- Config option `PackRConfig(bf16=True)` for compatibility with other tooling
+
+### 9. Per-block variation is real
 - Different layers converge at different rates (deeper layers faster)
-- Within a layer, all blocks converge similarly (same gradient direction)
-- Attenuation varies from 0.68 (still learning) to 1.0 (fully converged) across blocks at step 250
+- Within a layer, all rows vary independently
+- Attenuation ranges from ~0.0 (still learning) to 1.0 (fully converged) across rows
+- Layer 8-10 output converge fastest, layer 2-3 intermediate slowest
 
 ## Test Data (SST-2, no velvet)
 
@@ -53,7 +71,8 @@
 | `zstd_attenuation_sst2` | 8000 | 90.3% | v3 zstd, entropy floor capped |
 | `lsh_sst2` (v4, 0.9 gate) | 8000 | 90.31% | v4 LSH, gate killed training early |
 | `lsh_sst2` (v4, 0.99 gate) | 8000 | 91.87% | v4 LSH, gate threshold 0.99 |
-| `lsh_sst2` (v5, row-level) | running | TBD | v5 per-row LSH, Triton kernel, uint8 |
+| `lsh_sst2` (v5, K=32, binary byte match, window=1100) | 3740 | 92.81% | Signal dead until step ~200, then slow climb |
+| `lsh_sst2` (v6, K=16, continuous byte, window=4200) | 2496 | 92.19% | Real signal from step 1, still climbing |
 
 ## KNOWN BUGS / ISSUES
 
@@ -72,7 +91,19 @@
 - Per-prompt lookup table (2.5GB storage, unnecessary)
 - Block-level grouping (caps accuracy at 92%)
 
-## Removed Complexity (May 15)
+## VRAM Breakdown (BERT-base, batch=16, seq=128)
+
+| Component | Before (v5) | After (v6) | Delta |
+|-----------|-------------|------------|-------|
+| Model weights | 417MB (FFN 2×bf16 + attention fp32) | 316MB (all bf16 with `--bf16`) | -101MB |
+| LSH window | 369MB (GPU uint8 ring buffer) | 0MB (CPU pinned) | -369MB |
+| Optimizer (int8) | 213MB | 213MB | 0MB |
+| **Persistent total** | **~999MB** | **~529MB** | **-470MB** |
+| Gradients (peak) | 220MB | 220MB | 0MB |
+| Activations + overhead | ~500-800MB | ~500-800MB | 0MB |
+| **nvidia-smi** | **~2.2GB** | **~1.5GB** | **-700MB** |
+
+## Removed Complexity (May 15-16)
 
 | Component | Reason |
 |-----------|--------|
@@ -83,13 +114,23 @@
 | `torch.tensor(list, device=cuda)` | Attenuation stored as uint8 GPU tensor via register_buffer |
 | cuBLAS matmul for hash | Replaced by custom Triton kernel ([in_features, K] 2D grid) |
 | float32 intermediate in hash | Triton kernel computes dot products directly from bf16 |
+| GPU ring buffer | Moved to CPU pinned memory — saves 369MB GPU VRAM |
+| `_sim_sum`, `_sim_sqs` pre-allocation | Replaced by single batched compute_attenuation |
+| `self._atten_byte = ...` reassignment | Changed to in-place `.copy_()` — no buffer churn |
 
-## Determinism Status (May 15)
+## Determinism Status (May 16)
 
 Every component is a pure function of current state:
 - LSH hash: Triton kernel `sign(delta_row · proj_row)` — fixed seed, deterministic
-- Multi-scale comparison: `cos_sim = 2 * (hash == stored).mean() - 1`
-- Attenuation: `mean_sim * (1 - flatness)` → uint8 `(attn * 255).to(torch.uint8)`
+- Multi-scale comparison: `cos_sim = 2 * (1 - |diff|/255).mean() - 1` — continuous byte
+- Attenuation: `(mean_sim * (1 - flatness))²` → uint8 `(attn * 255).to(torch.uint8)`
 - Gate: `all(attenuation >= threshold)` — pure function
 - Checkpoint: zstd compress/decompress — lossless roundtrip
 - DataLoader: `torch.manual_seed(seed)` — fixed shuffle order
+- Async CPU push: `non_blocking=True` copy has full step (~1.3s) to complete before read
+
+## New Config Options
+
+| Flag | Config | Default | Effect |
+|------|--------|---------|--------|
+| `--bf16` | `PackRConfig(bf16=True)` | False | Convert model to bfloat16 before training (saves ~100MB VRAM) |

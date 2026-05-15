@@ -12,7 +12,7 @@ Hash computed via custom Triton kernel (single 2D launch, no float32 intermediat
 Attenuation stored as uint8 GPU tensor — 256 levels of resolution per row.
 
 No dictionaries, no reindex, no calibration, no compression, no historical state
-beyond a 60-step ring buffer of 64-bit row hashes.
+beyond a 4200-step ring buffer of packed LSH hashes (2 bytes/row).
 
 ## Quick Start
 
@@ -21,7 +21,7 @@ from transformers import AutoModelForSequenceClassification
 from zpackr import compress_model, ZPackRConfig
 from packr.optim import FusedQuantizedAdam
 
-config = ZPackRConfig(layer_scope="ffn")
+config = ZPackRConfig(layer_scope="ffn", bf16=True)  # bf16 saves ~100MB VRAM
 model = AutoModelForSequenceClassification.from_pretrained("bert-base-uncased", num_labels=2)
 model = compress_model(model, config)
 
@@ -43,7 +43,7 @@ for step, batch in enumerate(loader):
 Or the harness:
 ```bash
 python -m tools.diagnose --task sst2 --max-steps 8000 --batch-size 16 \
-    --eval-interval 500 --no-velvet --label my_run
+    --eval-interval 500 --no-velvet --bf16 --label my_run
 ```
 
 ## Architecture

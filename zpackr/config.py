@@ -15,6 +15,7 @@ class ZPackRConfig:
         use_8bit_optimizer:     Use FusedQuantizedAdam (Triton 8-bit Adam)
         offload:                Enable CPU/system RAM offloading
         block_size:             Salience block size
+        bf16:                   Convert model to bfloat16 before training
     """
 
     layer_scope: Literal["ffn", "attention", "all"] = "ffn"
@@ -22,6 +23,7 @@ class ZPackRConfig:
     use_8bit_optimizer: bool = True
     offload: bool = False
     block_size: int = 256
+    bf16: bool = False
 
     def to_packr_config(self) -> PackRConfig:
         return PackRConfig(
@@ -31,4 +33,5 @@ class ZPackRConfig:
             use_8bit_optimizer=self.use_8bit_optimizer,
             offload=self.offload,
             block_size=self.block_size,
+            bf16=self.bf16,
         )
