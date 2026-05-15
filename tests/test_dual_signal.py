@@ -16,7 +16,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from packr.zpackr_layer import ZPackRLinear, RATIO_FLOOR, RATIO_CEILING
+from packr.zpackr_layer import ZPackRLinear
 from packr.prompt_gate import should_skip_backward
 
 

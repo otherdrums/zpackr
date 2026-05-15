@@ -1,15 +1,22 @@
-"""ZPackRLinear — frozen base + zstd-compressed trainable delta.
+"""ZPackRLinear — frozen base + LZ4-attenuated trainable delta.
 
 Drop-in replacement for nn.Linear that stores a frozen base weight plus
-a zstd-compressed trainable delta.  Only salient blocks reside in VRAM.
+a trainable delta.  Per-block attenuation prevents overfitting by suppressing
+delta contribution for blocks the model has already converged on.
 
 Forward:  output = x @ (base_W + delta * (1 - attenuation))
-             └─ frozen ─┘   └─ trainable, zstd-compressed ─┘
+             └─ frozen ─┘   └─ trainable ─┘
 
-Per-block zstd compression ratios drive delta attenuation — blocks whose
-delta bytes compress well are attenuated, preventing overfitting at the
-block level.  The delta's current compressibility IS the knowledge metric;
-no historical state, no dictionaries, no calibration.
+The attenuation signal comes from DeltaAccumulator: delta bytes from every
+block at every post_step are accumulated. Current deltas are compressed
+against this accumulated history using zstd prefix dictionary mode.
+Blocks whose delta patterns match the accumulated history are "known"
+→ high compressibility → high attenuation → suppressed.
+Blocks with novel delta patterns are "novel" → low compressibility →
+low attenuation → train fully.
+
+AIT formula: attenuation = max(0, 1 - 1/(ratio × I_MAX))
+  I_MAX = 1/1.27 ≈ 0.79 (bf16 entropy floor, measured)
 """
 
 import math
@@ -21,12 +28,6 @@ import threading
 
 BLOCK_SIZE = 256
 
-# Fixed deterministic attenuation mapping constants.
-# RATIO_FLOOR: below this, block is fully novel (attenuation = 0).
-# RATIO_CEILING: at/above this, block is fully known (attenuation = 1).
-RATIO_FLOOR = 1.0
-RATIO_CEILING = 8.0
-
 # AIT-derived constant: bf16 entropy floor.
 # I_MAX = 1 / ratio_for_random_bf16
 # Measured: zstd compresses random bf16 to ~79% (ratio ~1.27).
@@ -36,6 +37,59 @@ I_MAX = 1.0 / 1.27  # ≈ 0.7874
 # Gate threshold: if ALL blocks across ALL layers have attenuation >= this,
 # the prompt is fully converged and backward can be skipped.
 ATTENUATION_SKIP_THRESHOLD = 0.9
+
+
+class DeltaAccumulator:
+    """Accumulates delta byte chunks and compresses against them using zstd prefix mode.
+
+    All ZPackRLinear layers share a single DeltaAccumulator. Each post_step,
+    layers append their delta bytes. Compression uses accumulated bytes as a
+    zstd prefix dictionary — blocks that match accumulated patterns compress
+    well (known), blocks that don't compress poorly (novel).
+    """
+
+    def __init__(self, max_bytes: int = 500_000_000):
+        self._chunks: list = []
+        self._total_bytes = 0
+        self._max_bytes = max_bytes
+        self._prefix_cache = None  # cached concatenated bytes
+        self._prefix_dirty = True
+
+    def append(self, block_bytes: bytes):
+        """Append delta bytes to the accumulator."""
+        if len(block_bytes) >= 256:
+            self._chunks.append(block_bytes)
+            self._total_bytes += len(block_bytes)
+            self._prefix_dirty = True
+            # Evict oldest if over cap
+            while self._total_bytes > self._max_bytes and len(self._chunks) > 1:
+                removed = self._chunks.pop(0)
+                self._total_bytes -= len(removed)
+
+    @property
+    def prefix_bytes(self) -> bytes:
+        """Cached concatenated prefix bytes for zstd prefix dict."""
+        if self._prefix_dirty:
+            self._prefix_cache = b"".join(self._chunks)
+            self._prefix_dirty = False
+        return self._prefix_cache
+
+    @property
+    def is_empty(self) -> bool:
+        return len(self._chunks) == 0
+
+    def compress(self, block_bytes: bytes) -> float:
+        """Compress a block against accumulated prefix. Returns ratio."""
+        prefix = self.prefix_bytes
+        if not prefix:
+            # No history — use raw zstd (entropy floor)
+            compressed = zstd.ZstdCompressor(level=1).compress(block_bytes)
+            return len(block_bytes) / max(len(compressed), 1)
+        dict_obj = zstd.ZstdCompressionDict(prefix,
+                                             dict_type=zstd.DICT_TYPE_RAWCONTENT)
+        cctx = zstd.ZstdCompressor(level=1, dict_data=dict_obj)
+        compressed = cctx.compress(block_bytes)
+        return len(block_bytes) / max(len(compressed), 1)
 
 
 class ZPackRLinear(nn.Module):
@@ -79,7 +133,6 @@ class ZPackRLinear(nn.Module):
         self._full_delta = None       # [in, out] on CPU — authoritative delta
         self._zstd_delta = None       # zstd-compressed delta bytes (checkpoint)
         self._salient_count = self.num_blocks  # cached, updated in post_step
-        self._salience_threshold = None  # pruning threshold (kept simple)
 
         # Cached kept-block indices (updated when mask changes)
         self._kept_indices = torch.arange(self.num_blocks, dtype=torch.long)
@@ -87,7 +140,7 @@ class ZPackRLinear(nn.Module):
         # Ratio cache for diagnostic tools — invalidated on post_step
         self._ratio_cache = None
 
-        # Per-block attenuation factors [0,1], computed from fixed constants.
+        # Per-block attenuation factors [0,1], computed from AIT formula.
         # 0.0 = fully active (novel), 1.0 = fully suppressed (known).
         self._attenuation_factors = None
         self._block_gaps = None  # cached per-block ratios
@@ -95,16 +148,19 @@ class ZPackRLinear(nn.Module):
         # Cached scatter indices for fused forward matmul
         self._scatter_indices = None  # pre-built for index_add_ in forward
 
-        # Async zstd compression — double-buffer attenuation
+        # Async compression — double-buffer attenuation
         self._attenuation_lock = threading.Lock()
-        self._attenuation_pending = None  # computed by background thread, ready to swap
-        self._attenuation_thread = None   # background thread handle
+        self._attenuation_pending = None  # computed by background thread
+        self._attenuation_thread = None
+
+        # Shared DeltaAccumulator (set by harness after creation)
+        self._accumulator: DeltaAccumulator = None
 
     def _compress_async(self):
-        """Compress delta blocks with zstd in a background thread.
+        """Compress delta blocks against accumulated prefix in background thread.
 
         Called after stage_delta_async() snapshots the CPU delta.
-        Uses multi_compress_to_buffer for bulk C-level compression.
+        Uses DeltaAccumulator prefix compression for temporal pattern matching.
         Sets self._attenuation_pending and self._block_gaps when done.
         """
         if self._full_delta is None:
@@ -117,44 +173,51 @@ class ZPackRLinear(nn.Module):
         delta_np = self._full_delta.view(torch.uint8).contiguous().view(-1).numpy()
         block_el_bytes = self.block_size * self.out_features * 2
         ratios = []
-        cctx = zstd.ZstdCompressor(level=1)
-        batch_bytes = []
-        batch_indices = []
 
-        for blk in range(self.num_blocks):
-            byte_start = blk * block_el_bytes
-            byte_end = min(byte_start + block_el_bytes, delta_np.nbytes)
-            if byte_end <= byte_start:
-                ratios.append(1.0)
-                continue
+        acc = self._accumulator
+        if acc is None:
+            # Fallback: raw zstd (no accumulator attached yet)
+            cctx = zstd.ZstdCompressor(level=1)
+            for blk in range(self.num_blocks):
+                byte_start = blk * block_el_bytes
+                byte_end = min(byte_start + block_el_bytes, delta_np.nbytes)
+                if byte_end <= byte_start:
+                    ratios.append(1.0)
+                    continue
+                blk_arr = delta_np[byte_start:byte_end]
+                if not np.any(blk_arr):
+                    ratios.append(1.0)
+                    continue
+                compressed = cctx.compress(blk_arr.tobytes())
+                ratios.append(len(blk_arr) / max(len(compressed), 1))
+        else:
+            # Prefix compression against accumulated history
+            for blk in range(self.num_blocks):
+                byte_start = blk * block_el_bytes
+                byte_end = min(byte_start + block_el_bytes, delta_np.nbytes)
+                if byte_end <= byte_start:
+                    ratios.append(1.0)
+                    continue
+                blk_arr = delta_np[byte_start:byte_end]
 
-            blk_arr = delta_np[byte_start:byte_end]
+                # Cold-start protection: near-zero delta → no attenuation
+                l2 = float(np.sqrt(np.sum(blk_arr.astype(np.float32) ** 2)))
+                if l2 < 1e-4:
+                    ratios.append(1.0)
+                    continue
 
-            # Cold-start protection: near-zero delta → no attenuation
-            # ratio=1.0 gives attenuation=0 via AIT formula (below entropy floor)
-            l2 = float(np.sqrt(np.sum(blk_arr.astype(np.float32) ** 2)))
-            if l2 < 1e-4:
-                ratios.append(1.0)
-                continue
+                if not np.any(blk_arr):
+                    ratios.append(1.0)
+                    continue
 
-            # Fast zero check via numpy
-            if not np.any(blk_arr):
-                ratios.append(float('inf'))
-                continue
+                # Prefix compression: compress against accumulated history
+                blk_bytes = blk_arr.tobytes()
+                ratios.append(acc.compress(blk_bytes))
 
-            batch_bytes.append(blk_arr.tobytes())
-            batch_indices.append(blk)
-            ratios.append(0.0)  # placeholder
-
-        # Bulk compress all non-zero blocks in one C-level call
-        if batch_bytes:
-            results = cctx.multi_compress_to_buffer(batch_bytes)
-            for idx, blk_bytes, result in zip(batch_indices, batch_bytes, results):
-                clen = len(result.tobytes())
-                ratios[idx] = len(blk_bytes) / max(clen, 1)
+                # Append delta bytes to accumulator (after compressing)
+                acc.append(blk_bytes)
 
         # AIT-derived attenuation: 1 - 1/(ratio * I_MAX)
-        # I_MAX = bf16 entropy floor (~0.79)
         factors = [max(0.0, 1.0 - 1.0 / (r * I_MAX)) for r in ratios]
 
         with self._attenuation_lock:
@@ -281,15 +344,16 @@ class ZPackRLinear(nn.Module):
     def post_step(self, threshold: float = None, calibration_multiplier: float = 0.01):
         """Update delta salience and attenuation factors.
 
-        Compresses every block's full delta bytes with zstd, derives
-        attenuation from fixed constants (RATIO_FLOOR, RATIO_CEILING),
-        and updates the block mask for pruning.
+        Compresses every block's full delta bytes against accumulated prefix,
+        derives attenuation via AIT formula, and updates block mask for pruning.
+        Also appends delta bytes to accumulator for future prefix compression.
         """
         self._sync_full_delta()
 
         delta_np = self._full_delta.view(torch.uint8).contiguous().view(-1).numpy()
         block_el_bytes = self.block_size * self.out_features * 2
         ratios = []
+        acc = self._accumulator
 
         for blk in range(self.num_blocks):
             byte_start = blk * block_el_bytes
@@ -300,14 +364,18 @@ class ZPackRLinear(nn.Module):
 
             blk_bytes = delta_np[byte_start:byte_end].tobytes()
 
-            # Zero-delta fast path: all-zero blocks → ratio=1.0 (below entropy floor, no attenuation)
+            # Zero-delta / cold-start: no attenuation
             if blk_bytes == b'\x00' * len(blk_bytes):
                 ratios.append(1.0)
                 continue
 
-            compressed = zstd.compress(blk_bytes)
-            ratio = len(blk_bytes) / max(len(compressed), 1)
-            ratios.append(ratio)
+            # Prefix compression against accumulated history
+            if acc is not None:
+                ratios.append(acc.compress(blk_bytes))
+                acc.append(blk_bytes)
+            else:
+                compressed = zstd.compress(blk_bytes)
+                ratios.append(len(blk_bytes) / max(len(compressed), 1))
 
         # AIT-derived attenuation: 1 - 1/(ratio * I_MAX)
         self._attenuation_factors = [
@@ -316,7 +384,7 @@ class ZPackRLinear(nn.Module):
         ]
 
         # Pruning: blocks at/above RATIO_CEILING are fully known → prune
-        use_threshold = threshold if threshold is not None else RATIO_CEILING * 0.75
+        use_threshold = threshold if threshold is not None else 8.0 * 0.75
 
         new_mask = torch.zeros(self.num_blocks, dtype=torch.bool)
         for blk in range(self.num_blocks):
@@ -422,9 +490,12 @@ class ZPackRLinear(nn.Module):
             if byte_end <= byte_start:
                 continue
             blk_bytes = delta_np[byte_start:byte_end].tobytes()
-            compressed = zstd.compress(blk_bytes)
-            ratio = len(blk_bytes) / max(len(compressed), 1)
-            ratios[blk] = ratio
+            acc = self._accumulator
+            if acc is not None:
+                ratios[blk] = acc.compress(blk_bytes)
+            else:
+                compressed = zstd.compress(blk_bytes)
+                ratios[blk] = len(blk_bytes) / max(len(compressed), 1)
 
             fs = blk * self.block_size
             fe = min(fs + self.block_size, self.in_features)
@@ -594,6 +665,7 @@ class ZPackRLinear(nn.Module):
         inst._attenuation_factors = None
         inst._zstd_delta = None
         inst._ratio_cache = None
+        inst._accumulator = None
         return inst
 
     # ── Conversion from nn.Linear ──

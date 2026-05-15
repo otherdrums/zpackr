@@ -11,7 +11,7 @@ Usage:
     # train normally — post_step() handles block-level attenuation
 """
 
-from .zpackr_layer import ZPackRLinear, BLOCK_SIZE, RATIO_FLOOR, RATIO_CEILING, ATTENUATION_SKIP_THRESHOLD
+from .zpackr_layer import ZPackRLinear, BLOCK_SIZE, I_MAX, ATTENUATION_SKIP_THRESHOLD, DeltaAccumulator
 from .config import ZPackRConfig
 from .layer_patcher import compress_model
 from .prompt_gate import should_skip_backward
@@ -20,9 +20,9 @@ from .checkpoint import save_zpackr_checkpoint, load_zpackr_checkpoint
 __all__ = [
     "ZPackRLinear",
     "BLOCK_SIZE",
-    "RATIO_FLOOR",
-    "RATIO_CEILING",
+    "I_MAX",
     "ATTENUATION_SKIP_THRESHOLD",
+    "DeltaAccumulator",
     "ZPackRConfig",
     "compress_model",
     "should_skip_backward",
