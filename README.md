@@ -165,7 +165,7 @@ runs/my_run_2026-05-14_runid/
 
 | Constant | Default | Meaning |
 |----------|:-------:|---------|
-| `K` (lsh_K) | `64` | LSH hash bits (higher = finer resolution, more memory) |
+| `K` (lsh_K) | `128` | LSH hash bits (higher = finer resolution, more memory) |
 | `WINDOW_SIZE` | `60` | Sliding window of hash snapshots |
 | `LSH_OFFSETS` | `(1,5,10,25,50)` | Multi-scale comparison offsets |
 | `ATTENUATION_SKIP_THRESHOLD` | `0.99` | Gate fires when all blocks ≥ this |
