@@ -37,7 +37,7 @@ class TestLSHSignal:
         db = DeltaSignatureDB(num_rows=8, K=64)
         delta = torch.randn(8, 32, dtype=torch.bfloat16)
         h = db.hash_rows(delta)
-        assert h.shape == (8, 64), f"Expected (8, 64), got {h.shape}"
+        assert h.shape == (8, 8), f"Expected (8, 8), got {h.shape}"
         assert h.dtype == torch.uint8
 
     def test_empty_window_gives_zero_attenuation(self):

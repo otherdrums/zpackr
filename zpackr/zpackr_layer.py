@@ -84,10 +84,12 @@ class DeltaSignatureDB:
 
     def __init__(self, num_rows: int, K: int = 32, window_size: int = 1100, seed: int = 42):
         self.K = K
+        self.bytes_per_hash = K // 8  # 4 bytes for K=32
         self.num_rows = num_rows
         self._window_size = window_size
-        # GPU circular buffer: [window_size, num_rows, K] uint8
-        self._gpu_window = torch.zeros(window_size, num_rows, K, dtype=torch.uint8, device='cuda')
+        # GPU circular buffer: [window_size, num_rows, bytes_per_hash] uint8
+        self._gpu_window = torch.zeros(window_size, num_rows, self.bytes_per_hash,
+                                       dtype=torch.uint8, device='cuda')
         self._cursor = 0   # next write position
         self._count = 0    # entries written (capped at window_size)
         # Pre-allocated working tensors (reused each call, avoids CUDA allocs)
@@ -110,13 +112,10 @@ class DeltaSignatureDB:
         return cls._projection_cache[key]
 
     def hash_rows(self, delta: torch.Tensor) -> torch.Tensor:
-        """LSH hash all rows via Triton kernel (GPU) or matmul fallback (CPU).
+        """LSH hash all rows and pack bits into bytes.
 
-        Args:
-            delta: [in_features, out_features] bf16 tensor
-
-        Returns:
-            [in_features, K] uint8 tensor (sign bits per row per projection)
+        Returns packed uint8 tensor of shape [in_features, K//8].
+        Each byte packs 8 LSH bits (bit 0 = projection k, bit 7 = k+7).
         """
         in_f, out_f = delta.shape
         proj = self.get_gpu_projections(out_f, self.K)
@@ -124,16 +123,20 @@ class DeltaSignatureDB:
         if delta.device.type == 'cpu':
             proj = proj.cpu()
             result = delta.float() @ proj.t()
-            return (result > 0).to(torch.uint8).cuda()
+            bits = (result > 0).to(torch.uint8).cuda()
+        else:
+            bits = torch.empty(in_f, self.K, dtype=torch.uint8, device='cuda')
+            grid = (in_f, self.K)
+            _lsh_hash_kernel[grid](
+                delta, proj, bits,
+                in_f, out_f, self.K,
+                BLOCK_OUT=BLOCK_SIZE,
+            )
 
-        hash_out = torch.empty(in_f, self.K, dtype=torch.uint8, device='cuda')
-        grid = (in_f, self.K)
-        _lsh_hash_kernel[grid](
-            delta, proj, hash_out,
-            in_f, out_f, self.K,
-            BLOCK_OUT=BLOCK_SIZE,
-        )
-        return hash_out
+        # Pack 8 bits per byte
+        bits_view = bits.view(in_f, self.bytes_per_hash, 8)
+        weights = torch.tensor([1, 2, 4, 8, 16, 32, 64, 128], device='cuda', dtype=torch.uint8)
+        return (bits_view * weights).sum(dim=2).to(torch.uint8)
 
     def push(self, hashes: torch.Tensor):
         """Append hash snapshot to the GPU ring buffer."""
@@ -144,10 +147,9 @@ class DeltaSignatureDB:
     def compute_attenuation(self, current_hashes: torch.Tensor) -> torch.Tensor:
         """Compute per-row attenuation from multi-scale comparison.
 
-        All window data is already on GPU — no device copies needed.
-
-        Args:
-            current_hashes: [in_features, K] uint8 tensor
+        current_hashes: [in_features, K//8] uint8 — packed bits, 8 bits per byte.
+        Window entries are also packed — comparison is byte-level (5 levels/offset
+        for K=32: 0, 0.25, 0.5, 0.75, 1.0 matching fraction).
 
         Returns:
             [in_features] float32 tensor, values in [0, 1]
