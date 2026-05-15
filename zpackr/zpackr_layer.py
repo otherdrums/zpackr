@@ -82,7 +82,7 @@ class DeltaSignatureDB:
 
     _projection_cache: dict = {}  # class-level: (K, out_features) → float32 GPU tensor
 
-    def __init__(self, num_rows: int, K: int = 128, window_size: int = 1100, seed: int = 42):
+    def __init__(self, num_rows: int, K: int = 32, window_size: int = 1100, seed: int = 42):
         self.K = K
         self.num_rows = num_rows
         self._window_size = window_size
@@ -190,7 +190,7 @@ class ZPackRLinear(nn.Module):
         bias:             torch.Tensor [out] bf16 (optional)
     """
 
-    def __init__(self, in_features, out_features, bias=True, lsh_K=128, lsh_window=1100):
+    def __init__(self, in_features, out_features, bias=True, lsh_K=32, lsh_window=1100):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
