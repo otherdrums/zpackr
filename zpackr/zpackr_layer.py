@@ -236,9 +236,9 @@ class ZPackRLinear(nn.Module):
                 self._attenuation_factors = self._attenuation_pending
                 self._attenuation_pending = None
 
-                # Pruning: blocks at/above RATIO_CEILING * 0.75 are fully known
+                # Pruning: blocks with high ratio are fully known → prune
                 if self._block_gaps is not None:
-                    use_threshold = RATIO_CEILING * 0.75
+                    use_threshold = 6.0  # ratio threshold for pruning
                     new_mask = torch.zeros(self.num_blocks, dtype=torch.bool)
                     for blk in range(self.num_blocks):
                         new_mask[blk] = self._block_gaps[blk] < use_threshold
@@ -383,8 +383,8 @@ class ZPackRLinear(nn.Module):
             for r in ratios
         ]
 
-        # Pruning: blocks at/above RATIO_CEILING are fully known → prune
-        use_threshold = threshold if threshold is not None else 8.0 * 0.75
+        # Pruning: blocks with high ratio are fully known → prune
+        use_threshold = threshold if threshold is not None else 6.0
 
         new_mask = torch.zeros(self.num_blocks, dtype=torch.bool)
         for blk in range(self.num_blocks):
