@@ -82,9 +82,9 @@ class DeltaSignatureDB:
 
     _projection_cache: dict = {}  # class-level: (K, out_features) → float32 GPU tensor
 
-    def __init__(self, num_rows: int, K: int = 32, window_size: int = 1100, seed: int = 42):
+    def __init__(self, num_rows: int, K: int = 16, window_size: int = 4200, seed: int = 42):
         self.K = K
-        self.bytes_per_hash = K // 8  # 4 bytes for K=32
+        self.bytes_per_hash = K // 8  # 2 bytes for K=16
         self.num_rows = num_rows
         self._window_size = window_size
         # GPU circular buffer: [window_size, num_rows, bytes_per_hash] uint8
@@ -147,9 +147,10 @@ class DeltaSignatureDB:
     def compute_attenuation(self, current_hashes: torch.Tensor) -> torch.Tensor:
         """Compute per-row attenuation from multi-scale comparison.
 
-        current_hashes: [in_features, K//8] uint8 — packed bits, 8 bits per byte.
-        Window entries are also packed — comparison is byte-level (5 levels/offset
-        for K=32: 0, 0.25, 0.5, 0.75, 1.0 matching fraction).
+        Uses continuous byte comparison: 1 - |hash - stored| / 255 per byte.
+        Each byte gives 256 levels of similarity — far finer than unpacked
+        bit-by-bit matching (which gives K+1 levels).  With K=16 packed into
+        2 bytes, effective resolution is ~512 levels per offset.
 
         Returns:
             [in_features] float32 tensor, values in [0, 1]
@@ -163,8 +164,11 @@ class DeltaSignatureDB:
             if off > count:
                 break
             idx = (self._cursor - off) % self._window_size
-            stored = self._gpu_window[idx]  # already on GPU — no .to() call
-            matching = (current_hashes == stored).float().mean(dim=1)
+            stored = self._gpu_window[idx].float()
+            # Continuous byte similarity: 1 - |diff| / 255 per byte
+            diff = (current_hashes.float() - stored).abs()
+            byte_sim = 1.0 - diff / 255.0
+            matching = byte_sim.mean(dim=1)  # average across packed bytes
             cos_sim = 2 * matching - 1
             self._sim_sum += cos_sim
             self._sim_sqs += cos_sim * cos_sim
@@ -192,7 +196,7 @@ class ZPackRLinear(nn.Module):
         bias:             torch.Tensor [out] bf16 (optional)
     """
 
-    def __init__(self, in_features, out_features, bias=True, lsh_K=32, lsh_window=1100):
+    def __init__(self, in_features, out_features, bias=True, lsh_K=16, lsh_window=4200):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features

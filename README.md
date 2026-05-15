@@ -52,10 +52,11 @@ python -m tools.diagnose --task sst2 --max-steps 8000 --batch-size 16 \
 Text → BERT forward/backward → delta on GPU
                                   │
                Custom Triton kernel: sign(delta @ projections.T)
-                   2D grid (in_features × K=32), single launch
+                   2D grid (in_features × K=16), single launch
                                   │
-         log-spaced multi-scale cos_sim vs 1100-step window
+         log-spaced multi-scale cos_sim vs 4200-step window
             offsets: (1, 3, 10, 30, 100, 300, 1000)
+            continuous byte comparison — ~512 levels/offset
                                   │
          attenuation = (mean_sim × (1 - flatness))² → uint8 [0, 255]
                                   │
@@ -93,8 +94,8 @@ The hash is computed by a custom Triton kernel (`_lsh_hash_kernel`) with a
 1. Forward:       delta *= (1 - attenuation/255) per row → combined matmul → output
 2. Backward:      grad flows only to delta_salient (base_W is frozen)
 3. Optimizer:     FusedQuantizedAdam updates delta_salient on GPU
-4. Hash (GPU):    Triton kernel (K=32) → sign bits → push to 1100-step window
-5. Attenuation:   log-spaced multi-scale (×7) → (mean_sim × (1 - flatness))² → uint8
+4. Hash (GPU):    Triton kernel (K=16) → sign bits → packed to 2 bytes → 4200-step window
+5. Attenuation:   continuous byte comparison → log-spaced multi-scale (×7) → (mean_sim × (1 - flatness))² → uint8
 6. Gate:          convergence check — all rows ≥ 1.0 → skip backward
 ```
 
@@ -123,10 +124,17 @@ less memory bandwidth.
 resolution of K=32 (32 levels) or K=64 (64 levels). Stored as `register_buffer`
 on GPU — zero `torch.tensor(list)` calls in forward, zero Python→GPU syncs.
 
-**Sliding window over prompt table**: A 1100-step ring buffer of 32-bit hashes
-(~202MB for 46K rows) replaces the 67K-entry per-prompt table (~2.5GB).
-Log-spaced multi-scale comparison (offsets 1, 3, 10, 30, 100, 300, 1000)
-captures convergence at time scales from 1 to 1000 steps — 1000× dynamic range.
+**Sliding window over prompt table**: A 4200-step ring buffer of 16-bit hashes
+packed into 2 bytes (~378MB for 46K rows). Continuous byte comparison
+(`1 - |diff| / 255`) gives ~512 similarity levels per offset — 8× the resolution
+of bit-by-bit matching. Log-spaced multi-scale offsets (1, 3, 10, 30, 100, 300,
+1000) capture convergence at time scales from 1 to 1000 steps.
+
+**Continuous byte comparison**: Instead of counting matching bits, measure the
+byte-level difference between packed hashes. Two hashes that differ by 1 bit 
+out of 16 produce byte values differing by 1/255 → similarity ≈ 0.996. Random
+hashes differ by ~85/255 → similarity ≈ 0.67. This gives a smooth, continuous
+similarity signal even with compact K=16 hashes.
 
 **Pure deterministic computation**: Attenuation is `mean_sim × (1 - flatness)`
 → `(value * 255).to(torch.uint8)`. No thresholds, no conditionals, no historical
@@ -188,8 +196,8 @@ runs/my_run_2026-05-14_runid/
 
 | Constant | Default | Meaning |
 |----------|:-------:|---------|
-| `K` (lsh_K) | `32` | LSH hash bits (higher = finer resolution, more memory) |
-| `WINDOW_SIZE` | `1100` | Sliding window of hash snapshots |
+| `K` (lsh_K) | `16` | LSH hash bits (packed into K//8 bytes, continuous byte comparison) |
+| `WINDOW_SIZE` | `4200` | Sliding window of hash snapshots (matches 1 SST-2 epoch) |
 | `LSH_OFFSETS` | `(1,3,10,30,100,300,1000)` | Log-spaced multi-scale comparison offsets (3x spacing) |
 | `ATTENUATION_SKIP_THRESHOLD` | `1.0` | Gate fires when all rows ≥ this (min over rows) |
 | Attenuation formula | `squared` | `(mean_sim * (1 - flatness))²` — compresses distribution |
