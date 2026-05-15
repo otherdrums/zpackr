@@ -34,27 +34,33 @@
 - Fix: raise threshold to 0.99, compute hash every step (even when gate fires)
 - Initial fix results: 91.87% at step 1500, 0% gate skip rate, still climbing
 
-### 4. GPU hash is fast (~1ms for 24 layers)
-- Two shared projection matrices on GPU (120MB VRAM)
-- No GPU→CPU copy of delta (108MB/step eliminated)
-- No CPU matmul (7.2 GFLOPS/step eliminated)
-- No background thread, no threading complexity
+### 4. GPU hash speed is unknown (need profiling)
+- Early estimate of "~1ms for 24 layers" was wrong
+- Back-of-napkin: 24 Triton kernel launches with 737K total blocks should take 10-80ms
+- Actual measured step time is ~1.29s vs estimated full-finetune baseline ~0.9-1.0s
+- ZPackR overhead is ~300-400ms — need per-component timers to find the real bottleneck
 
-### 6. Continuous byte comparison fixes dead signal
+### 5. Continuous byte comparison fixes dead signal
 - v5 with K=32 + binary byte match + squared formula produced attenation stuck at 0.0 for 3500 steps
 - K=32 packed into 4 bytes + binary match → 5 similarity levels/offset
 - K=16 packed into 2 bytes + continuous byte comparison `1 - |diff|/255` → ~512 levels/offset
 - Fix: switch to continuous byte comparison — signal alive from step 1
 
-### 7. GPU window is the largest VRAM consumer
+### 6. GPU window is the largest VRAM consumer
 - GPU window (4200 × 46080 × 2 uint8) = 369MB — biggest single chunk
 - CPU-pinned window saves 369MB GPU VRAM at cost of ~644KB/step transfer (~40μs)
 - Async `copy_(non_blocking=True)` in push — data arrives before next compute_attenuation
 
-### 8. Model loaded in fp32 wastes ~100MB
+### 7. Model loaded in fp32 wastes ~100MB
 - HuggingFace default loads in fp32; attention/embedding/pooler layers stay fp32
 - With `--bf16` flag, entire model converts to bfloat16 — saves ~100MB, no quality impact
 - Config option `PackRConfig(bf16=True)` for compatibility with other tooling
+
+### 8. ZPackRLinear is now dtype-agnostic
+- Forward no longer hardcodes `.float()` cast — output dtype matches input dtype
+- bf16 input → bf16 output, fp32 input → fp32 output
+- Enables clean bf16 mode without dtype cascading issues
+- LayerNorm reverted to fp32 + forward patch handles bf16 input internally
 
 ### 9. Per-block variation is real
 - Different layers converge at different rates (deeper layers faster)
@@ -128,6 +134,38 @@ Every component is a pure function of current state:
 - Checkpoint: zstd compress/decompress — lossless roundtrip
 - DataLoader: `torch.manual_seed(seed)` — fixed shuffle order
 - Async CPU push: `non_blocking=True` copy has full step (~1.3s) to complete before read
+
+## Per-Step Timing (metrics.jsonl)
+
+Per-component timers added to every step record (fields prefixed with `t_`):
+
+| Field | What it measures | Current estimate |
+|-------|-----------------|-----------------|
+| `t_forward` | model forward pass (incl. weight assembly) | ~? ms |
+| `t_gate` | should_skip_backward check | ~? ms |
+| `t_backward` | loss.backward | ~? ms |
+| `t_optimizer` | optimizer.step + zero_grad | ~? ms |
+| `t_hash` | compute_hash_gpu × 24 layers | ~? ms |
+| `t_ratio_log` | _log_ratios (diagnose only) | ~? ms |
+| `step_ms` | total step wall time | ~1290 ms |
+
+To view:
+```bash
+python3 -c "import json;f=open('PATH/metrics.jsonl');[print(f\"{d['step']:5d} fwd={d.get('t_forward',0):5.1f} bwd={d.get('t_backward',0):5.1f} opt={d.get('t_optimizer',0):5.1f} hash={d.get('t_hash',0):5.1f} tot={d['step_ms']:.0f}ms\") for l in f if (d:=json.loads(l)).get('type')=='step']"
+```
+
+## Speed Optimization Roadmap
+
+**Target**: Match full finetune speed (~0.9-1.0s/step), down from current ~1.29s.
+
+**Planned optimizations** (ordered by impact):
+
+1. **Hash every N steps** — Convergence signal changes slowly (offsets span 1-1000). Hash every 4-8 steps with zero quality impact; amortized cost drops 4-8×.
+2. **Cache combined weight W** — `base_W + delta * (1-nv)` must still be computed every step (delta changes), but fusion with matmul could eliminate materialization overhead.
+3. **Parallel hash streams** — Launch hash kernels for all 24 layers concurrently on separate CUDA streams. Wall time drops from sequential sum to max-per-layer.
+4. **Fused weight+matmul kernel** — Custom Triton kernel: load `x`, `base_W`, `delta`, `nv` → compute `x @ (base_W + delta*(1-nv))` in one shot. Eliminates ~540MB/step of memory traffic.
+
+**First step**: Profile with the new timers to identify where the actual 300-400ms goes.
 
 ## New Config Options
 
