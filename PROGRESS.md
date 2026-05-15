@@ -11,7 +11,8 @@
 | v1 (initial) | zstd + WeightDict | CPU threaded | Dictionary + reindex | **Superseded** |
 | v2 (LZ4, May 13) | LZ4 per-block | CPU | None | **Superseded** — ratios < 1.0 |
 | v3 (zstd, May 14) | zstd per-block | CPU background thread | None | **Superseded** — entropy floor |
-| v4 (LSH, May 14-15) | LSH multi-scale sliding window | GPU synchronous (~1ms) | Per-block ring buffer (60 steps) | **Current** |
+| v4 (LSH, May 14-15) | LSH multi-scale sliding window | GPU synchronous (~1ms) | Per-block ring buffer (60 steps) | **Superseded** — block-level caps accuracy |
+| v5 (Row LSH, May 15) | Per-row LSH + Triton kernel + uint8 | GPU Triton kernel | Per-row ring buffer (60 steps) | **Current** |
 
 ## Key Findings
 
@@ -51,13 +52,14 @@
 | `epoch2_full` | 8000 | 94.06% | v1, gate on |
 | `zstd_attenuation_sst2` | 8000 | 90.3% | v3 zstd, entropy floor capped |
 | `lsh_sst2` (v4, 0.9 gate) | 8000 | 90.31% | v4 LSH, gate killed training early |
-| `lsh_sst2` (v4, 0.99 gate) | 8000 (running) | 91.87%+ | v4 LSH, gate threshold 0.99 |
+| `lsh_sst2` (v4, 0.99 gate) | 8000 | 91.87% | v4 LSH, gate threshold 0.99 |
+| `lsh_sst2` (v5, row-level) | running | TBD | v5 per-row LSH, Triton kernel, uint8 |
 
 ## KNOWN BUGS / ISSUES
 
-- `compute_hash_gpu` on CPU-only models (testing) copies GPU projections to CPU — works but slow
-- `_build_reindex()` in train_harness.py removed but some refs may linger
-- Per-block variation is layer-level, not truly per-block (blocks in same layer converge similarly)
+- Triton kernel compilation on first call adds ~2s latency — acceptable
+- CPU fallback for hash_rows is slower (cuBLAS matmul instead of Triton kernel)
+- No pruning (all rows stay active) — may use more VRAM than necessary
 
 ## NOT TO RETRY
 
@@ -68,27 +70,26 @@
 - Super Dict as gate (word-length dependent)
 - Variance gating (stale ratios)
 - Per-prompt lookup table (2.5GB storage, unnecessary)
+- Block-level grouping (caps accuracy at 92%)
 
-## Removed Complexity (May 14-15)
+## Removed Complexity (May 15)
 
 | Component | Reason |
 |-----------|--------|
-| `DeltaAccumulator` (zstd prefix dict) | Entropy floor — no signal |
-| `_compress_async` | Replaced by GPU synchronous hash |
-| `swap_attenuation` | Hash updates `_attenuation_factors` directly |
-| `stage_delta_async` / `apply_staged_delta` | No CPU delta copy needed |
-| `_attenuation_lock`, `_attenuation_pending` | No threading |
-| `_zstd_thread` (background thread) | Replaced by GPU sync |
-| `zstandard` in hot path | Only used for checkpoint I/O |
-| Pruning (block mask) | All blocks stay active, just attenuated |
-| Per-prompt attenuation table | Sliding window approach works without it |
+| Block-level grouping | Replaced by per-row — each row converges independently |
+| `num_blocks`, `block_mask`, `_kept_indices`, `_scatter_indices` | No more block-level machinery |
+| `F.pad` + reshape in hash | delta is already [in_features, out_features] |
+| `repeat_interleave` in forward | Attenuation is already [in_features] — direct unsqueeze |
+| `torch.tensor(list, device=cuda)` | Attenuation stored as uint8 GPU tensor via register_buffer |
+| cuBLAS matmul for hash | Replaced by custom Triton kernel ([in_features, K] 2D grid) |
+| float32 intermediate in hash | Triton kernel computes dot products directly from bf16 |
 
 ## Determinism Status (May 15)
 
 Every component is a pure function of current state:
-- LSH hash: `sign(delta_flat @ projections.T)` — fixed random projections
+- LSH hash: Triton kernel `sign(delta_row · proj_row)` — fixed seed, deterministic
 - Multi-scale comparison: `cos_sim = 2 * (hash == stored).mean() - 1`
-- Attenuation: `mean_sim * (1 - flatness)` — pure function, no thresholds
+- Attenuation: `mean_sim * (1 - flatness)` → uint8 `(attn * 255).to(torch.uint8)`
 - Gate: `all(attenuation >= threshold)` — pure function
 - Checkpoint: zstd compress/decompress — lossless roundtrip
 - DataLoader: `torch.manual_seed(seed)` — fixed shuffle order

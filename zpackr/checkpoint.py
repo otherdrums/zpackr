@@ -1,7 +1,4 @@
-"""Model-level checkpoint save/load for ZPackR.
-
-LZ4-compressed delta serialization — no dictionary state needed.
-"""
+"""Model-level checkpoint save/load for ZPackR."""
 
 import os
 import torch
@@ -18,7 +15,7 @@ def save_zpackr_checkpoint(model, path: str):
             layer_idx += 1
 
     meta = {
-        "version": 2,
+        "version": 3,
         "num_layers": layer_idx,
         "layer_names": [
             name for name, m in model.named_modules()
@@ -39,12 +36,11 @@ def load_zpackr_checkpoint(model, path: str):
             if layer_idx >= meta["num_layers"]:
                 break
             restored = ZPackRLinear.load_checkpoint(os.path.join(path, str(layer_idx)))
-            module.delta_salient.data = restored.delta_salient.data
-            module.block_mask.copy_(restored.block_mask)
-            module._full_delta = restored._full_delta
-            module._zstd_delta = restored._zstd_delta
+            module.delta_salient.data = restored.delta_salient.data.to(device=module.delta_salient.device)
             if module.bias is not None and restored.bias is not None:
-                module.bias.data = restored.bias.data
+                module.bias.data = restored.bias.data.to(device=module.bias.device)
+            # Ensure _atten_byte is on the correct device
+            module._atten_byte = module._atten_byte.to(device=module.delta_salient.device)
             layer_idx += 1
 
     return model

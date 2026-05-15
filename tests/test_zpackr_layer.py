@@ -1,9 +1,8 @@
-"""Tests for zpackr_layer.py — ZPackRLinear (LZ4-based)."""
+"""Tests for zpackr_layer.py — ZPackRLinear (LSH-based)."""
 
 import os
 import tempfile
 import torch
-import math
 import pytest
 from packr.zpackr_layer import ZPackRLinear
 
@@ -37,10 +36,12 @@ class TestZPackRLinear:
         assert diff < 0.5, f"Max diff {diff:.4f} exceeds bf16 tolerance"
 
     def test_post_step(self, layer, device):
-        n_blocks_before = int(layer.block_mask.sum().item())
+        # post_step should compute attenuation (no crash)
         layer.post_step()
-        n_blocks_after = int(layer.block_mask.sum().item())
-        assert n_blocks_after <= n_blocks_before
+        attn = layer._atten_byte.float()
+        assert attn.numel() == layer.in_features
+        # First post_step with empty window → attenuation = 0
+        assert attn.max().item() == 0.0
 
     def test_checkpoint_roundtrip(self, layer, device):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -56,10 +57,6 @@ class TestZPackRLinear:
             out_rest = restored(x)
             diff = (out_orig - out_rest).abs().max().item()
             assert diff < 0.3, f"Checkpoint roundtrip diff {diff:.4f} too large"
-
-            assert restored.block_mask.sum().item() == layer.block_mask.sum().item(), (
-                "Block mask should be preserved"
-            )
 
     def test_gradient_flow(self, layer, device):
         x = torch.randn(8, layer.in_features, device=device)
