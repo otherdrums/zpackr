@@ -90,6 +90,9 @@ class DeltaSignatureDB:
         self._gpu_window = torch.zeros(window_size, num_rows, K, dtype=torch.uint8, device='cuda')
         self._cursor = 0   # next write position
         self._count = 0    # entries written (capped at window_size)
+        # Pre-allocated working tensors (reused each call, avoids CUDA allocs)
+        self._sim_sum = torch.zeros(num_rows, device='cuda')
+        self._sim_sqs = torch.zeros(num_rows, device='cuda')
 
     @classmethod
     def get_gpu_projections(cls, out_features: int, K: int = 64, seed: int = 42) -> torch.Tensor:
@@ -150,9 +153,8 @@ class DeltaSignatureDB:
             [in_features] float32 tensor, values in [0, 1]
         """
         n_offsets = 0
-        dev = current_hashes.device
-        sim_sum = torch.zeros(self.num_rows, device=dev)
-        sim_sqs = torch.zeros(self.num_rows, device=dev)
+        self._sim_sum.zero_()
+        self._sim_sqs.zero_()
 
         count = self._count
         for off in LSH_OFFSETS:
@@ -162,15 +164,15 @@ class DeltaSignatureDB:
             stored = self._gpu_window[idx]  # already on GPU — no .to() call
             matching = (current_hashes == stored).float().mean(dim=1)
             cos_sim = 2 * matching - 1
-            sim_sum += cos_sim
-            sim_sqs += cos_sim * cos_sim
+            self._sim_sum += cos_sim
+            self._sim_sqs += cos_sim * cos_sim
             n_offsets += 1
 
         if n_offsets == 0:
-            return torch.zeros(self.num_rows, device=dev)
+            return torch.zeros(self.num_rows, device='cuda')
 
-        mean_sim = sim_sum / n_offsets
-        variance = sim_sqs / n_offsets - mean_sim * mean_sim
+        mean_sim = self._sim_sum / n_offsets
+        variance = self._sim_sqs / n_offsets - mean_sim * mean_sim
         flatness = torch.sqrt(torch.clamp(variance, min=0.0))
 
         attenuation = mean_sim * (1.0 - flatness)
