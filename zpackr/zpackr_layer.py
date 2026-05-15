@@ -23,7 +23,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import zstandard as zstd
-from collections import deque
 
 import triton
 import triton.language as tl
@@ -72,8 +71,8 @@ class DeltaSignatureDB:
     """Sliding window of LSH hashes for per-row convergence detection.
 
     Each step, all delta rows are LSH-hashed via Triton kernel and appended
-    to a ring buffer.  Multi-scale comparison against past hashes produces
-    mean_sim and flatness signals per row.
+    to a ring buffer stored directly on GPU.  Multi-scale comparison against
+    past hashes produces mean_sim and flatness signals per row.
 
     Attenuation = mean_sim * (1 - flatness) → uint8 [0, 255].
       - Converged + stable → ~255 (fully attenuated)
@@ -81,18 +80,22 @@ class DeltaSignatureDB:
       - Novel (no history) → 0 (fully active)
     """
 
-    _projection_cache: dict = {}  # class-level: (K, out_features) → bf16 GPU tensor
+    _projection_cache: dict = {}  # class-level: (K, out_features) → float32 GPU tensor
 
     def __init__(self, num_rows: int, K: int = 64, window_size: int = 60, seed: int = 42):
         self.K = K
         self.num_rows = num_rows
-        self._window: deque = deque(maxlen=window_size)
+        self._window_size = window_size
+        # GPU circular buffer: [window_size, num_rows, K] uint8
+        self._gpu_window = torch.zeros(window_size, num_rows, K, dtype=torch.uint8, device='cuda')
+        self._cursor = 0   # next write position
+        self._count = 0    # entries written (capped at window_size)
 
     @classmethod
     def get_gpu_projections(cls, out_features: int, K: int = 64, seed: int = 42) -> torch.Tensor:
         """Get or create shared GPU projection matrix for a given out_features.
 
-        Returns a [K, out_features] bf16 tensor cached on GPU, shared across
+        Returns a [K, out_features] float32 tensor cached on GPU, shared across
         all layers with the same out_features.
         """
         key = (K, out_features)
@@ -130,11 +133,15 @@ class DeltaSignatureDB:
         return hash_out
 
     def push(self, hashes: torch.Tensor):
-        """Append hash snapshot to the window."""
-        self._window.append(hashes.clone())
+        """Append hash snapshot to the GPU ring buffer."""
+        self._gpu_window[self._cursor] = hashes.to(device='cuda', dtype=torch.uint8)
+        self._cursor = (self._cursor + 1) % self._window_size
+        self._count = min(self._count + 1, self._window_size)
 
     def compute_attenuation(self, current_hashes: torch.Tensor) -> torch.Tensor:
         """Compute per-row attenuation from multi-scale comparison.
+
+        All window data is already on GPU — no device copies needed.
 
         Args:
             current_hashes: [in_features, K] uint8 tensor
@@ -147,16 +154,27 @@ class DeltaSignatureDB:
         sim_sum = torch.zeros(self.num_rows, device=dev)
         sim_sqs = torch.zeros(self.num_rows, device=dev)
 
-        window_len = len(self._window)
+        count = self._count
         for off in LSH_OFFSETS:
-            if off > window_len:
+            if off > count:
                 break
-            stored = self._window[-off].to(device=dev)
+            idx = (self._cursor - off) % self._window_size
+            stored = self._gpu_window[idx]  # already on GPU — no .to() call
             matching = (current_hashes == stored).float().mean(dim=1)
             cos_sim = 2 * matching - 1
             sim_sum += cos_sim
             sim_sqs += cos_sim * cos_sim
             n_offsets += 1
+
+        if n_offsets == 0:
+            return torch.zeros(self.num_rows, device=dev)
+
+        mean_sim = sim_sum / n_offsets
+        variance = sim_sqs / n_offsets - mean_sim * mean_sim
+        flatness = torch.sqrt(torch.clamp(variance, min=0.0))
+
+        attenuation = mean_sim * (1.0 - flatness)
+        return torch.clamp(attenuation, 0.0, 1.0)
 
         if n_offsets == 0:
             return torch.zeros(self.num_rows, device=dev)
