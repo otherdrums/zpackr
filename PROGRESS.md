@@ -123,6 +123,8 @@
 | GPU ring buffer | Moved to CPU pinned memory — saves 369MB GPU VRAM |
 | `_sim_sum`, `_sim_sqs` pre-allocation | Replaced by single batched compute_attenuation |
 | `self._atten_byte = ...` reassignment | Changed to in-place `.copy_()` — no buffer churn |
+| 2D hash kernel `(in_features, K)` grid | Replaced by 1D fused kernel `(in_features,)` — 16× fewer launches, 16× less delta traffic |
+| `.float()` cast in ZPackRLinear forward | Output dtype now matches input dtype — dtype-agnostic |
 
 ## Determinism Status (May 16)
 
@@ -135,37 +137,63 @@ Every component is a pure function of current state:
 - DataLoader: `torch.manual_seed(seed)` — fixed shuffle order
 - Async CPU push: `non_blocking=True` copy has full step (~1.3s) to complete before read
 
-## Per-Step Timing (metrics.jsonl)
+## Per-Step Timing (metrics.jsonl, with fused kernel)
 
-Per-component timers added to every step record (fields prefixed with `t_`):
+Per-component timers in every step record (fields prefixed with `t_`, ms):
 
-| Field | What it measures | Current estimate |
-|-------|-----------------|-----------------|
-| `t_forward` | model forward pass (incl. weight assembly) | ~? ms |
-| `t_gate` | should_skip_backward check | ~? ms |
-| `t_backward` | loss.backward | ~? ms |
-| `t_optimizer` | optimizer.step + zero_grad | ~? ms |
-| `t_hash` | compute_hash_gpu × 24 layers | ~? ms |
-| `t_ratio_log` | _log_ratios (diagnose only) | ~? ms |
-| `step_ms` | total step wall time | ~1290 ms |
+| Field | What it measures | Current (v6) |
+|-------|-----------------|--------------|
+| `t_forward` | Python forward launch overhead | ~33ms |
+| `t_gate` | CUDA sync — captures actual **forward** GPU time | ~289ms |
+| `t_backward` | backward GPU execution | ~311ms |
+| `t_optimizer` | optimizer.step + zero_grad | ~235ms |
+| `t_hash` | **fused hash kernel** + attenuation × 24 layers | ~?ms (TBD with fused) |
+| `t_ratio_log` | _log_ratios overhead | ~3ms |
+| `step_ms` | total step wall time | ~?ms (TBD with fused) |
 
 To view:
 ```bash
 python3 -c "import json;f=open('PATH/metrics.jsonl');[print(f\"{d['step']:5d} fwd={d.get('t_forward',0):5.1f} bwd={d.get('t_backward',0):5.1f} opt={d.get('t_optimizer',0):5.1f} hash={d.get('t_hash',0):5.1f} tot={d['step_ms']:.0f}ms\") for l in f if (d:=json.loads(l)).get('type')=='step']"
 ```
 
-## Speed Optimization Roadmap
+## Speed Optimization
 
-**Target**: Match full finetune speed (~0.9-1.0s/step), down from current ~1.29s.
+**Current**: ~1.29s/step (measured with profiling timers).
+**Target**: Match full finetune speed (~0.9-1.0s/step).
 
-**Planned optimizations** (ordered by impact):
+**Initial profiling data** (v6 before fused kernel):
 
-1. **Hash every N steps** — Convergence signal changes slowly (offsets span 1-1000). Hash every 4-8 steps with zero quality impact; amortized cost drops 4-8×.
-2. **Cache combined weight W** — `base_W + delta * (1-nv)` must still be computed every step (delta changes), but fusion with matmul could eliminate materialization overhead.
-3. **Parallel hash streams** — Launch hash kernels for all 24 layers concurrently on separate CUDA streams. Wall time drops from sequential sum to max-per-layer.
-4. **Fused weight+matmul kernel** — Custom Triton kernel: load `x`, `base_W`, `delta`, `nv` → compute `x @ (base_W + delta*(1-nv))` in one shot. Eliminates ~540MB/step of memory traffic.
+| Component | GPU time | % of step |
+|-----------|----------|-----------|
+| Forward (incl. weight assembly) | 289ms | 22% |
+| Backward | 311ms | 24% |
+| Optimizer step | 235ms | 18% |
+| **Hash + Attenuation** | **415ms** | **32%** |
+| Overhead | 38ms | 3% |
 
-**First step**: Profile with the new timers to identify where the actual 300-400ms goes.
+### Optimization 1: Fused 1D hash kernel ✓ (implemented)
+
+Old kernel: 2D grid `(in_features, K)` — 16 blocks per row, each reloading delta[row] independently.
+New kernel: 1D grid `(in_features,)` — one block per row processes ALL K projections. Delta loaded ONCE.
+
+- Delta memory traffic reduced **16×** (was K copies per row, now 1)
+- Kernel launches reduced **16×** (was in_features × K, now in_features)
+- `tl.store(hash_ptr + ... + tl.arange(0, K), result)` — K bits stored in one call
+- `non_blocking=True` in compute_attenuation's `.cuda()` — avoids Python blocking on CPU→GPU transfers
+
+### Optimization 2: Hash every N steps (planned)
+
+Convergence signal changes slowly (offsets span 1-1000). Hash every 4-8 steps with zero quality impact. Amortized hash cost drops 4-8×.
+
+| Scenario | Step time | vs target |
+|----------|-----------|-----------|
+| Baseline tweaking | TBD after fused | — |
+| + hash interval 4 | ~1023ms est. | ≈ matches |
+| + hash interval 8 | ~970ms est. | ✅ faster |
+
+### Optimization 3: Parallel hash streams (if needed)
+
+Launch hash kernels for all 24 layers concurrently on separate CUDA streams. Wall time drops from sequential sum to max-per-layer. Most useful if hash remains the bottleneck after interval.
 
 ## New Config Options
 

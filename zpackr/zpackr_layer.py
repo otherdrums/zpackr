@@ -39,32 +39,39 @@ LSH_OFFSETS = (1, 3, 10, 30, 100, 300, 1000)
 
 
 @triton.jit
-def _lsh_hash_kernel(
+def _lsh_hash_fused_kernel(
     delta_ptr,     # [in_features, out_features] bf16 row-major
     proj_ptr,      # [K, out_features] bf16 row-major
     hash_ptr,      # [in_features, K] uint8 output
     in_features,
     out_features,
-    K,
+    K: tl.constexpr,
     BLOCK_OUT: tl.constexpr,
 ):
-    """Triton kernel: LSH hash for one layer's delta.
+    """Fused Triton kernel: all K LSH hashes for one delta row.
 
-    Grid: (in_features, K) — one block per (row, projection) pair.
-    Each block computes sign(delta[row, :] · proj[k, :]).
+    Grid: (in_features,) — one block per row processes ALL K projections.
+    Delta[row] is loaded ONCE per chunk instead of K times, cutting
+    delta memory traffic by 16× vs the old 2D (in_features, K) grid.
     """
     row = tl.program_id(0)
-    k = tl.program_id(1)
+    offs = tl.arange(0, BLOCK_OUT)
 
-    acc = 0.0
+    # K per-projection accumulators (fits in float32 registers for K=16)
+    acc = tl.zeros([K], dtype=tl.float32)
+
     for start in range(0, out_features, BLOCK_OUT):
-        offs = start + tl.arange(0, BLOCK_OUT)
-        mask = offs < out_features
-        d = tl.load(delta_ptr + row * out_features + offs, mask=mask).to(tl.float32)
-        p = tl.load(proj_ptr + k * out_features + offs, mask=mask).to(tl.float32)
-        acc += tl.sum(d * p)
+        o = start + offs
+        mask = o < out_features
+        d = tl.load(delta_ptr + row * out_features + o, mask=mask).to(tl.float32)
 
-    tl.store(hash_ptr + row * K + k, (acc > 0).to(tl.uint8))
+        for k in range(K):
+            p = tl.load(proj_ptr + k * out_features + o, mask=mask).to(tl.float32)
+            dot = tl.sum(d * p)
+            acc = tl.where(tl.arange(0, K) == k, acc + dot, acc)
+
+    # Store all K hash bits contiguously (avoids per-element indexing)
+    tl.store(hash_ptr + row * K + tl.arange(0, K), (acc > 0).to(tl.uint8))
 
 
 class DeltaSignatureDB:
@@ -127,10 +134,11 @@ class DeltaSignatureDB:
             bits = (result > 0).to(torch.uint8).cuda()
         else:
             bits = torch.empty(in_f, self.K, dtype=torch.uint8, device='cuda')
-            grid = (in_f, self.K)
-            _lsh_hash_kernel[grid](
+            grid = (in_f,)
+            _lsh_hash_fused_kernel[grid](
                 delta, proj, bits,
-                in_f, out_f, self.K,
+                in_f, out_f,
+                K=self.K,
                 BLOCK_OUT=BLOCK_SIZE,
             )
 
@@ -173,8 +181,8 @@ class DeltaSignatureDB:
         if n_offsets == 0:
             return torch.zeros(self.num_rows, device='cuda')
 
-        # Batched transfer CPU pinned → GPU (single operation, ~644KB)
-        stored_slices = [self._window_cpu[i].cuda() for i in indices]
+        # Batched transfer CPU pinned → GPU (non_blocking avoids Python sync)
+        stored_slices = [self._window_cpu[i].cuda(non_blocking=True) for i in indices]
         stored = torch.stack(stored_slices).float()  # [n_off, num_rows, bytes] float32
 
         # Batched continuous byte comparison across all offsets
