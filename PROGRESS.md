@@ -13,7 +13,8 @@
 | v3 (zstd, May 14) | zstd per-block | CPU background thread | None | **Superseded** — entropy floor |
 | v4 (LSH, May 14-15) | LSH multi-scale sliding window | GPU synchronous (~1ms) | Per-block ring buffer (60 steps) | **Superseded** — block-level caps accuracy |
 | v5 (Row LSH, May 15) | Per-row LSH + Triton kernel + uint8 + log-spaced offsets | GPU Triton kernel (K=32) | Per-row ring buffer (1100 steps) | **Superseded** |
-| v6 (CPU Window, May 15) | CPU-pinned window + batched GPU compute + optional bf16 | GPU Triton kernel (K=16) | Per-row CPU ring buffer (4200 steps) | **Current** |
+| v6 (CPU Window, May 15) | CPU-pinned window + batched GPU compute + optional bf16 | GPU Triton kernel (K=16) | Per-row CPU ring buffer (4200 steps) | **Superseded** |
+| v7 (Fused Hash, May 15) | Fused 1D hash kernel + hash interval + dtype-agnostic forward | GPU Triton (1D grid, K=16 fused) | Per-row CPU ring buffer (4200 steps) | **Current** |
 
 ## Key Findings
 
@@ -125,6 +126,7 @@
 | `self._atten_byte = ...` reassignment | Changed to in-place `.copy_()` — no buffer churn |
 | 2D hash kernel `(in_features, K)` grid | Replaced by 1D fused kernel `(in_features,)` — 16× fewer launches, 16× less delta traffic |
 | `.float()` cast in ZPackRLinear forward | Output dtype now matches input dtype — dtype-agnostic |
+| Full-step hash (every step, 415ms) | Configurable `hash_interval=N` — amortized cost drops N× |
 
 ## Determinism Status (May 16)
 
@@ -181,15 +183,21 @@ New kernel: 1D grid `(in_features,)` — one block per row processes ALL K proje
 - `tl.store(hash_ptr + ... + tl.arange(0, K), result)` — K bits stored in one call
 - `non_blocking=True` in compute_attenuation's `.cuda()` — avoids Python blocking on CPU→GPU transfers
 
-### Optimization 2: Hash every N steps (planned)
+### Optimization 2: Hash interval ✓ (implemented)
 
-Convergence signal changes slowly (offsets span 1-1000). Hash every 4-8 steps with zero quality impact. Amortized hash cost drops 4-8×.
+`--hash-interval N`: compute LSH every N steps, reuse attenuation in between.
+The convergence signal is averaged across offsets spanning 1-1000 steps —
+lagging by N steps is negligible.
 
-| Scenario | Step time | vs target |
-|----------|-----------|-----------|
-| Baseline tweaking | TBD after fused | — |
-| + hash interval 4 | ~1023ms est. | ≈ matches |
-| + hash interval 8 | ~970ms est. | ✅ faster |
+| N | Amortized hash | Est. step time | vs target |
+|---|----------------|----------------|-----------|
+| 1 (default) | 396ms | ~1288ms | -288ms |
+| 4 | 99ms | ~991ms | ≈ matches |
+| 8 | 50ms | ~942ms | ✅ faster |
+
+Counter-based skip in `compute_hash_gpu()` — returns early when
+`_hash_counter < _hash_interval`. Window pushes only on hash steps
+(coarser offsets, same log-spacing).
 
 ### Optimization 3: Parallel hash streams (if needed)
 
@@ -200,3 +208,4 @@ Launch hash kernels for all 24 layers concurrently on separate CUDA streams. Wal
 | Flag | Config | Default | Effect |
 |------|--------|---------|--------|
 | `--bf16` | `PackRConfig(bf16=True)` | False | Convert model to bfloat16 before training (saves ~100MB VRAM) |
+| `--hash-interval` | `PackRConfig(hash_interval=N)` | 1 | Compute LSH hash every N steps (amortized cost drops N×) |

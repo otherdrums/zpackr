@@ -16,6 +16,7 @@ class ZPackRConfig:
         offload:                Enable CPU/system RAM offloading
         block_size:             Salience block size
         bf16:                   Convert model to bfloat16 before training
+        hash_interval:          Compute LSH hash every N steps (default 1 = every step)
     """
 
     layer_scope: Literal["ffn", "attention", "all"] = "ffn"
@@ -24,6 +25,7 @@ class ZPackRConfig:
     offload: bool = False
     block_size: int = 256
     bf16: bool = False
+    hash_interval: int = 1
 
     def to_packr_config(self) -> PackRConfig:
         return PackRConfig(
@@ -34,4 +36,5 @@ class ZPackRConfig:
             offload=self.offload,
             block_size=self.block_size,
             bf16=self.bf16,
+            hash_interval=self.hash_interval,
         )

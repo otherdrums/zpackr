@@ -211,10 +211,12 @@ class ZPackRLinear(nn.Module):
         bias:             torch.Tensor [out] bf16 (optional)
     """
 
-    def __init__(self, in_features, out_features, bias=True, lsh_K=16, lsh_window=4200):
+    def __init__(self, in_features, out_features, bias=True, lsh_K=16, lsh_window=4200, hash_interval=1):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
+        self._hash_interval = hash_interval
+        self._hash_counter = 0
 
         # Frozen base — stored in bf16 for direct matmul compatibility
         self.base_W = nn.Parameter(
@@ -251,9 +253,19 @@ class ZPackRLinear(nn.Module):
         """Compute LSH hash via Triton kernel, update per-row attenuation.
 
         Called after optimizer.step().  Uses shared GPU projection matrices
-        and the custom Triton _lsh_hash_kernel — no float32 intermediate,
+        and the custom Triton _lsh_hash_fused_kernel — no float32 intermediate,
         no separate cuBLAS launch.
+
+        When hash_interval > 1, the hash + attenuation computation is only
+        performed every N steps.  On skipped steps the current attenuation
+        is reused — this is safe because the convergence signal changes
+        slowly (multi-scale offsets span 1-1000 steps).
         """
+        self._hash_counter += 1
+        if self._hash_counter < self._hash_interval:
+            return
+        self._hash_counter = 0
+
         # LSH hash all rows via Triton kernel
         current_hashes = self._sig_db.hash_rows(self.delta_salient)
 
@@ -408,10 +420,11 @@ class ZPackRLinear(nn.Module):
     # ── Conversion from nn.Linear ──
 
     @classmethod
-    def from_linear(cls, module: nn.Linear):
+    def from_linear(cls, module: nn.Linear, hash_interval: int = 1):
         """Convert nn.Linear → frozen base + zero delta."""
         inst = cls(module.in_features, module.out_features,
-                   bias=module.bias is not None)
+                   bias=module.bias is not None,
+                   hash_interval=hash_interval)
 
         w = module.weight.detach().t().contiguous()
         inst.base_W.data.copy_(w.to(torch.bfloat16))
