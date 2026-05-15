@@ -400,10 +400,6 @@ class ZPackRLinear(nn.Module):
         self._ratio_cache = None
 
     @property
-    def salience_threshold(self):
-        return self._salience_threshold
-
-    @property
     def salient_count(self) -> int:
         return self._salient_count
 
