@@ -51,12 +51,13 @@ python -m tools.diagnose --task sst2 --max-steps 8000 --batch-size 16 \
 ```
 Text → BERT forward/backward → delta on GPU
                                   │
-              Custom Triton kernel: sign(delta @ projections.T)
-                   2D grid (in_features × K), single launch
+               Custom Triton kernel: sign(delta @ projections.T)
+                   2D grid (in_features × K=32), single launch
                                   │
-         multi-scale cos_sim vs 60-step sliding window
+         log-spaced multi-scale cos_sim vs 1100-step window
+            offsets: (1, 3, 10, 30, 100, 300, 1000)
                                   │
-         attenuation = mean_sim × (1 - flatness) → uint8 [0, 255]
+         attenuation = (mean_sim × (1 - flatness))² → uint8 [0, 255]
                                   │
                Forward: delta *= (1 - nv/255) per row
                Gate:    if all rows ≥ 1.0 → skip backward
@@ -92,8 +93,8 @@ The hash is computed by a custom Triton kernel (`_lsh_hash_kernel`) with a
 1. Forward:       delta *= (1 - attenuation/255) per row → combined matmul → output
 2. Backward:      grad flows only to delta_salient (base_W is frozen)
 3. Optimizer:     FusedQuantizedAdam updates delta_salient on GPU
-4. Hash (GPU):    Triton kernel → sign bits → push to sliding window
-5. Attenuation:   mean_sim × (1 - flatness) → uint8 [0, 255]
+4. Hash (GPU):    Triton kernel (K=32) → sign bits → push to 1100-step window
+5. Attenuation:   log-spaced multi-scale (×7) → (mean_sim × (1 - flatness))² → uint8
 6. Gate:          convergence check — all rows ≥ 1.0 → skip backward
 ```
 
@@ -122,10 +123,10 @@ less memory bandwidth.
 resolution of K=32 (32 levels) or K=64 (64 levels). Stored as `register_buffer`
 on GPU — zero `torch.tensor(list)` calls in forward, zero Python→GPU syncs.
 
-**Sliding window over prompt table**: A 60-step ring buffer of 64-bit hashes
-(~22MB for 46K rows) replaces the 67K-entry per-prompt table (~2.5GB).
-Multi-scale comparison (offsets 1, 5, 10, 25, 50) captures convergence at
-multiple time scales.
+**Sliding window over prompt table**: A 1100-step ring buffer of 32-bit hashes
+(~202MB for 46K rows) replaces the 67K-entry per-prompt table (~2.5GB).
+Log-spaced multi-scale comparison (offsets 1, 3, 10, 30, 100, 300, 1000)
+captures convergence at time scales from 1 to 1000 steps — 1000× dynamic range.
 
 **Pure deterministic computation**: Attenuation is `mean_sim × (1 - flatness)`
 → `(value * 255).to(torch.uint8)`. No thresholds, no conditionals, no historical

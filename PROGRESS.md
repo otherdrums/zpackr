@@ -12,7 +12,7 @@
 | v2 (LZ4, May 13) | LZ4 per-block | CPU | None | **Superseded** — ratios < 1.0 |
 | v3 (zstd, May 14) | zstd per-block | CPU background thread | None | **Superseded** — entropy floor |
 | v4 (LSH, May 14-15) | LSH multi-scale sliding window | GPU synchronous (~1ms) | Per-block ring buffer (60 steps) | **Superseded** — block-level caps accuracy |
-| v5 (Row LSH, May 15) | Per-row LSH + Triton kernel + uint8 | GPU Triton kernel | Per-row ring buffer (60 steps) | **Current** |
+| v5 (Row LSH, May 15) | Per-row LSH + Triton kernel + uint8 + log-spaced offsets | GPU Triton kernel (K=32) | Per-row ring buffer (1100 steps) | **Current** |
 
 ## Key Findings
 
