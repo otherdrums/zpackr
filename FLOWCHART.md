@@ -1,4 +1,4 @@
-# ZPackR — Block-Level System Flowchart
+# ZPackR — Block-Level System Flowchart (v4 LSH)
 
 ## 1. System Overview
 
@@ -16,41 +16,21 @@
                        │  loss.backward()                        │
                        │      │                                  │
                        │      ▼                                  │
-                       │  optimizer.step()   ← FusedQuantizedAdam│
+                       │  optimizer.step()  ← FusedQuantizedAdam │
                        │      │                                  │
-                       │      ├─ post_step()  every step         │
-                       │      │    zstd.compress(block) → ratio  │
-                       │      │    ratio → attenuation factors   │
+                       │      ├─ compute_hash_gpu()  every step  │
+                       │      │    LSH hash → sliding window     │
+                       │      │    multi-scale cos_sim → attn    │
                        │      │                                  │
-                       │      ├─ convergence gate               │
-                       │      │    all blocks ≥ 0.9? → skip      │
+                       │      ├─ convergence gate (threshold 0.99)│
+                       │      │    all blocks ≥ 0.99? → skip     │
                        │      │                                  │
-                       │      └─ optimizer.zero_grad()            │
+                       │      └─ optimizer.zero_grad()           │
                        └─────────────────────────────────────────┘
                                       │
                                       ▼
                                Predictions
 ```
-
-```mermaid
-flowchart TD
-    A[Input Text] --> B[BERT Forward]
-    B --> C[ZPackRLinear.forward]
-    C --> D["x @ (base_W + delta*(1-attenuation))"]
-    D --> E[Loss]
-    E --> F[loss.backward]
-    F --> G[optimizer.step]
-    G --> H{step % N == 0?}
-    H -->|yes| I[post_step: zstd ratios]
-    H -->|no| J[Convergence Gate]
-    I --> J
-    J --> K{all atten >= 0.9?}
-    K -->|yes| L[Skip backward next step]
-    K -->|no| M[optimizer.zero_grad]
-    M --> B
-```
-
----
 
 ## 2. Per-Step Detail
 
@@ -80,12 +60,14 @@ STEP N (every step):
   ┌──────────────────────────────────────────────────────────────┐
   │ 2. CONVERGENCE GATE                                          │
   │                                                              │
-  │   if all(layer._attenuation_factors >= 0.9                  │
+  │   if all(layer._attenuation_factors >= 0.99                  │
   │           for layer in zpl_layers):                          │
   │       gate_skipped = True                                    │
   │       → skip backward, record step                           │
   │   else:                                                      │
   │       gate_skipped = False                                   │
+  │                                                              │
+  │   Hash is computed EVERY step (even on gate-skipped)         │
   └──────────────────────────────────────────────────────────────┘
                               │ (if not skipped)
                               ▼
@@ -95,137 +77,75 @@ STEP N (every step):
   │   loss.backward()                                            │
   │   → gradients flow through attenuated delta                  │
   │   → fully-attenuated blocks get ~0 gradient                  │
-  │   → base_W gets 0 gradient (frozen)                         │
+  │   → base_W gets 0 gradient (frozen)                          │
   └──────────────────────────────────────────────────────────────┘
                               │
                               ▼
   ┌──────────────────────────────────────────────────────────────┐
-  │ 4. OPTIMIZER + ATTENUATION                                   │
+  │ 4. OPTIMIZER + HASH                                          │
   │                                                              │
   │   optimizer.step()                                           │
   │   → FusedQuantizedAdam updates delta_salient on GPU          │
-  │   → (optional) VelvetController adjusts per-layer LRs         │
   │   → optimizer.zero_grad()                                    │
   │                                                              │
-  │   post_step() — every step, zero lag:                         │
-  │     sync delta GPU→CPU                                       │
-  │     for each block:                                          │
-  │       if L2 < 1e-4 → ratio=1.0, attenuation=0.0 (cold-start)│
-  │       else → zstd.compress(bytes) → ratio                    │
-  │     attenuation = max(0, 1 - 1/(ratio × I_MAX))              │
-  │     if ratio >= 6.0 → prune                                  │
+  │   compute_hash_gpu() — every step, ~1ms total on GPU:        │
+  │     padded = F.pad(delta_salient, ...)                       │
+  │     blocks = padded.reshape(n_blocks, block_elements)        │
+  │     proj = blocks.float() @ projections_gpu.t()              │
+  │     hash = (proj > 0).to(torch.uint8)                        │
+  │     push hash → sliding window                               │
+  │     attenuation = compute_attenuation(hash)                   │
+  │     → attenuation = mean_sim * (1 - flatness)                │
   └──────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 3. Signal Flow — Compression Chain (runs every step)
+## 3. Signal Flow — LSH Hash Chain (every step, GPU)
 
 ```
-FULL DELTA MATRIX [in_features × out_features] bf16
+DELTA SALIENT on GPU [in_features × out_features] bf16
 │
-│  Split into blocks of size BLOCK_SIZE (256)
+│  F.pad + reshape → [num_blocks, block_size × out_features]
 │
-├── Block 0: rows [0:256]     × out_features  → 256*out*2 bytes
-│              ┌─ L2 < 1e-4? → ratio=1.0, attenuation=0.0 (cold-start)
-│              └─ else → zstd.compress() → ratio
-│
-├── Block 1: rows [256:512]   × out_features  → ...
-│
-│   ... (num_blocks = ceil(in_features / 256))
-│
-└── Block N-1: rows [N*256:in] × out_features → ...
+├── Block 0: [block_size × out_features] bf16 → flat
+├── Block 1: [block_size × out_features] bf16 → flat
+├── ...
+└── Block N-1: [block_size × out_features] bf16 → flat
 
                     │
                     ▼
 
-    For each block i: attenuation[i] = max(0, 1 - 1/(ratio_i × I_MAX))
-    I_MAX = 1/1.27 ≈ 0.79 (bf16 entropy floor)
+  blocks_flat.float() @ projections_gpu.t()   # GPU matmul
+  → [num_blocks, K] float32
+  → sign → [num_blocks, K] uint8 hash
+
+  projections_gpu: two shared matrices (120MB total):
+    - intermediate: [64, 256×3072] bf16  (96MB)
+    - output:       [64, 256×768]  bf16  (24MB)
 
                     │
                     ▼
 
-    FORWARD:  combined delta contribution = delta[i] * (1 - attenuation[i])
-              → applied per block in the cuBLAS matmul
+  For offsets o in (1, 5, 10, 25, 50):
+    if o ≤ len(window):
+      stored = window[-o]              # hash from o steps ago
+      matching = (hash == stored).mean(dim=1)
+      cos_sim = 2 × matching - 1
 
-    GATE:     if all(attenuation[i] >= 0.9 for all i in all layers)
-              → should_skip_backward() = True
-```
-STEP where step % post_step_interval == 0:
-═══════════════════════════════════════════════════════════════════
+  mean_sim = mean(cos_sim across offsets)
+  variance = var(cos_sim across offsets)
+  flatness = sqrt(variance)
+  attenuation = mean_sim × (1 - flatness)
 
-  ┌──────────────────────────────────────────────────────────────┐
-  │ 1. SYNC DELTA TO CPU                                         │
-  │                                                              │
-  │   module._sync_full_delta()                                  │
-  │   → if _staged_cpu available: use fast path                  │
-  │   → else: delta_salient.cpu()                                │
-  │   → scatter compacted GPU view into _full_delta [in, out]    │
-  └──────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-  ┌──────────────────────────────────────────────────────────────┐
-  │ 2. PER-BLOCK zstd COMPRESSION                                │
-  │                                                              │
-  │   delta_np = _full_delta.view(uint8).contiguous().numpy()    │
-  │   block_el_bytes = block_size * out_features * 2             │
-  │                                                              │
-  │   for blk in range(num_blocks):                              │
-  │       byte_start = blk * block_el_bytes                      │
-  │       byte_end   = min(byte_start + block_el_bytes, nbytes)  │
-  │                                                              │
-  │       # Variance gate: skip if delta L2 unchanged > 15%      │
-  │       if abs(l2 - prev_l2) / prev_l2 < 0.15:                │
-  │           reuse cached ratio                                 │
-  │           continue                                           │
-  │                                                              │
-  │       blk_bytes = delta_np[byte_start:byte_end].tobytes()    │
-  │       compressed = zstd.compress(blk_bytes)                  │
-  │       ratio = len(blk_bytes) / len(compressed)                │
-  │       # ~1.27 for non-zero delta, ~13,000 for zero delta     │
-  └──────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-  ┌──────────────────────────────────────────────────────────────┐
-  │ 3. ATTENUATION MAPPING                                       │
-  │                                                              │
-  │   RATIO_FLOOR = 1.0    # minimum possible ratio              │
-  │   RATIO_CEILING = 8.0  # ratio at which block is "known"    │
-  │                                                              │
-  │   for r in ratios:                                           │
-  │       attenuation = clamp((r - 1.0) / 7.0, 0.0, 1.0)        │
-  │                                                              │
-  │   Examples:                                                  │
-  │     ratio=1.27 → atten=(1.27-1)/7 = 0.039  (3.9% suppressed)│
-  │     ratio=1.50 → atten=(1.50-1)/7 = 0.071  (7.1% suppressed)│
-  │     ratio=2.00 → atten=(2.00-1)/7 = 0.143  (14.3%)          │
-  │     ratio=13,000 → atten=capped at 1.0    (100% suppressed)  │
-  └──────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-  ┌──────────────────────────────────────────────────────────────┐
-  │ 4. PRUNING (VRAM management)                                 │
-  │                                                              │
-  │   use_threshold = RATIO_CEILING * 0.75   # = 6.0            │
-  │                                                              │
-  │   for each block:                                            │
-  │       if ratio < 6.0 → KEEP in delta_salient (novel)        │
-  │       if ratio >= 6.0 → PRUNE from delta_salient (known)    │
-  │                                                              │
-  │   If mask changed:                                           │
-  │       _rebuild_delta_salient()  # re-compact GPU view        │
-  └──────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-  ┌──────────────────────────────────────────────────────────────┐
-  │ 5. CACHE RESULTS                                             │
-  │                                                              │
-  │   _block_gaps = ratios          # for variance gating        │
-  │   _attenuation_factors = [...]  # for forward matmul         │
-  │   _ratio_cache = None           # invalidated               │
-  │                                                              │
-  │   → Used in next N forward passes until next post_step       │
-  └──────────────────────────────────────────────────────────────┘
+                    │
+                    ▼
+
+  FORWARD:  combined delta contribution = delta[i] × (1 - attenuation[i])
+            → applied per block in the cuBLAS matmul
+
+  GATE:     if all(attenuation[i] >= 0.99 for all i in all layers)
+            → should_skip_backward() = True
 ```
 
 ---
@@ -235,118 +155,67 @@ STEP where step % post_step_interval == 0:
 A single block (256 × out_features) goes through these states:
 
 ```
-                              ┌──────────────┐
-                    ┌─────────│    ZERO      │ delta = 0
-                    │         │    DELTA     │ ratio ≈ 1.0 (L2 < 1e-4)
-                    │         │              │ attenuation = 0.0 (cold-start)
-                    │         │   on GPU ✓   │
-                    │         └──────┬───────┘
-                    │                │ optimizer.step()
-                    │                │ delta becomes non-zero
-                    │                ▼
-                    │         ┌──────────────┐
-                    │         │  TRAINING    │ delta ≠ 0
-                    │         │   BLOCK      │ ratio ≈ 1.27
-                    │         │              │ attenuation ≈ 0.04
-                    │         │   on GPU ✓   │
-                    │         └──────┬───────┘
-                    │                │ ratio creeps up as delta
-                    │                │ develops compressible structure
-                    │                ▼
-                    │         ┌──────────────┐
-                    │         │ CONVERGING   │ delta ≠ 0
-                    │         │   BLOCK      │ ratio ↗ 1.3 → 2.0+
-                    │         │              │ attenuation ↗
-                    │         │   on GPU ✓   │
-                    │         └──────┬───────┘
-                    │                │
-                    │    ┌───────────┴───────────┐
-                    │    │                       │
-                    │    │ ratio ≥ 6.0           │ ratio < 6.0
-                    │    ▼                       │
-                    │ ┌──────────────┐          │ continues training
-                    │ │   PRUNED     │          │
-                    │ │   BLOCK      │ delta preserved on CPU
-                    │ │              │ not in delta_salient
-                    │ │  off GPU ✗   │
-                    │ └──────┬───────┘
-                    │        │
-                    │        │ delta changes enough to
-                    │        │ become novel again
-                    │        │ (future: regrow)
-                    │        │
-                    └────────┘
-```
-
-```mermaid
-stateDiagram-v2
-    [*] --> ZERO_DELTA
-    ZERO_DELTA --> TRAINING : optimizer.step()
-    TRAINING --> CONVERGING : ratio creeps up
-    CONVERGING --> PRUNED : ratio >= 6.0
-    PRUNED --> ZERO_DELTA : regrow (future)
-    
-    note right of ZERO_DELTA
-        ratio ≈ 1.0 (L2 < 1e-4)
-        attenuation = 0.0
-        on GPU
-    end note
-    
-    note right of TRAINING
-        ratio ≈ 1.27
-        attenuation ≈ 0.04
-        on GPU
-    end note
-    
-    note right of CONVERGING
-        ratio ↗ 1.3–2.0+
-        attenuation ↗
-        on GPU
-    end note
-    
-    note right of PRUNED
-        delta on CPU only
-        off GPU
-    end note
+                   ┌────────────────┐
+                   │    FRESH       │ delta = 0
+                   │    BLOCK       │ LSH hash = f(zeros)
+                   │                │ attenuation = 0.0 (no window)
+                   │   on GPU ✓     │
+                   └───────┬────────┘
+                           │ optimizer.step()
+                           │ delta becomes non-zero
+                           ▼
+                   ┌────────────────┐
+                   │   LEARNING     │ delta ≠ 0, direction changes
+                   │    BLOCK       │ LSH changes each step
+                   │                │ mean_sim < 0.9
+                   │   on GPU ✓     │ flatness > 0.05
+                   └───────┬────────┘
+                           │ delta direction stabilizes
+                           ▼
+                   ┌────────────────┐
+                   │  CONVERGING    │ delta ≠ 0, direction stable
+                   │    BLOCK       │ LSH changes slowly
+                   │                │ mean_sim 0.9-0.99
+                   │   on GPU ✓     │ flatness 0.01-0.05
+                   └───────┬────────┘
+                           │ delta very stable
+                           ▼
+                   ┌────────────────┐
+                   │  CONVERGED     │ delta stable
+                   │    BLOCK       │ LSH unchanged across window
+                   │                │ mean_sim ≈ 1.0
+                   │   on GPU ✓     │ flatness ≈ 0.0
+                   └───────┬────────┘
+                           │
+                           │ new prompt changes delta
+                           ▼
+                   ┌────────────────┐
+                   │   LEARNING     │ (cycle repeats)
+                   │    BLOCK       │
+                   └────────────────┘
 ```
 
 ---
 
-## 5. Signal Flow — Compression Chain
+## 5. Determinism Chain
 
 ```
-FULL DELTA MATRIX [in_features × out_features] bf16
-│
-│  Split into blocks of size BLOCK_SIZE (256)
-│
-├── Block 0: rows [0:256]     × out_features  → 256*out*2 bytes
-│                                              → zstd.compress()
-│                                              → ratio_0
-│
-├── Block 1: rows [256:512]   × out_features  → 256*out*2 bytes
-│                                              → zstd.compress()
-│                                              → ratio_1
-│
-├── Block 2: rows [512:768]   × out_features  → ...
-│
-│   ... (num_blocks = ceil(in_features / 256))
-│
-└── Block N-1: rows [N*256:in] × out_features → ...
+Every component is a pure function:
 
-                    │
-                    ▼
-
-    For each block i: attenuation[i] = max(0, 1 - 1/(ratio_i × I_MAX))
-    I_MAX = 1/1.27 ≈ 0.79 (bf16 entropy floor)
-
-                    │
-                    ▼
-
-    FORWARD:  combined delta contribution = delta[i] * (1 - attenuation[i])
-              → applied per block in the cuBLAS matmul
-
-    GATE:     if all(attenuation[i] >= 0.9 for all i in all layers)
-              → should_skip_backward() = True
+seed (42) → torch.Generator → random projections [K, block_elements]
+                                              │
+                                              ▼
+delta_salient (GPU) → F.pad → reshape → blocks_flat
+                                              │
+                                              ▼
+            blocks_flat @ projections.T → sign → hash (uint8)
+                                              │
+                                              ▼
+    hash vs window[-1], window[-5], ..., window[-50]
+    → cos_sim per offset → mean_sim, flatness → attenuation
+                                              │
+                                              ▼
+                Forward: delta × (1 - attenuation)
 ```
 
 ---
@@ -361,17 +230,17 @@ Every training step, before backward:
       if factors is None:
           return False  ← no factors yet → keep training
 
-      if any(f < 0.9 for f in factors):
+      if any(f < 0.99 for f in factors):
           return False  ← at least one block still novel
 
-  return True  ← ALL blocks across ALL layers are fully attenuated
+  return True  ← ALL blocks across ALL layers fully attenuated
 
                    │
                    ├── True  → skip backward (gate_skipped = True)
                    └── False → loss.backward() + optimizer.step()
 
-Future: when gate skip rate > threshold (e.g. 95%),
-          training auto-terminates.
+  Hash is still computed on gate-skipped steps (window evolves).
+  If a block dips below 0.99, gate opens on next step.
 ```
 
 ---
@@ -381,8 +250,8 @@ Future: when gate skip rate > threshold (e.g. 95%),
 ```
 SAVE:
   for each ZPackRLinear layer:
-      sync delta GPU → CPU
-      zstd.compress(full_delta bytes) → .zstd file
+      delta_cpu = delta_salient.cpu()             # GPU→CPU copy
+      zstd.compress(delta_cpu bytes) → .zstd file
       torch.save(base_W) → .base_W file
       torch.save(block_mask) → .mask file
       torch.save(metadata) → .meta file
@@ -391,49 +260,5 @@ RESTORE:
   zstd.decompress(.zstd file) → full_delta bf16
   load base_W, block_mask
   rebuild delta_salient from kept blocks
-```
-
----
-
-## Data Flow Summary (ASCII)
-
-```
-                 ┌──────────────┐
-                 │  INPUT TEXT  │
-                 └──────┬───────┘
-                        │ tokenize
-                 ┌──────▼───────┐
-                 │  BERT MODEL  │
-                 │  (modified)  │
-                 └──────┬───────┘
-                        │
-          ┌─────────────┼─────────────┐
-          │             │             │
-     Layer 0       Layer 1      Layer 11
-     ┌──────┐      ┌──────┐      ┌──────┐
-     │base_W│      │base_W│      │base_W│
-     │+delta│      │+delta│      │+delta│
-     │*(1-a)│      │*(1-a)│      │*(1-a)│
-     └──┬───┘      └──┬───┘      └──┬───┘
-        │              │              │
-        │   ┌──────────┴──────────┐   │
-        │   │  LOSS & BACKWARD    │   │
-        │   └──────────┬──────────┘   │
-        │              │              │
-        │   ┌──────────▼──────────┐   │
-        │   │  OPTIMIZER.STEP()   │   │
-        │   │  (FusedQuantizedAdam)│  │
-        │   └──────────┬──────────┘   │
-        │              │              │
-        │   ┌──────────▼──────────┐   │
-        │   │    post_step()      │   │
-        │   │  zstd per block     │   │
-        │   │  → attenuation      │   │
-        │   └──────────┬──────────┘   │
-        │              │              │
-        └──────────────┼──────────────┘
-                       │
-                ┌──────▼───────┐
-                │  PREDICTIONS │
-                └──────────────┘
+  initialize fresh DeltaSignatureDB (empty window)
 ```

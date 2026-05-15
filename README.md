@@ -1,23 +1,15 @@
 # ZPackR — Deterministic Per-Block Delta Attenuation
 
-> **Warning — Experimental.**  ZPackR is in early development and not yet ready
-> for production use.  APIs and training dynamics are subject to change without
-> notice.  Expect breakage and iteration.
+> **Warning — Experimental.** ZPackR is in early development and not yet ready
+> for production use. APIs and training dynamics are subject to change without
+> notice. Expect breakage and iteration.
 
-Frozen BERT base + zstd-compressed trainable delta.  Per-block zstd
-compressibility directly attenuates delta contribution in the forward
-pass — the delta's current compressibility IS the knowledge metric.
-No dictionaries, no reindex, no calibration, no historical state.
+Frozen BERT base + LSH-attenuated trainable delta. Per-block LSH (Locality-Sensitive
+Hashing) of delta vectors produces a cosine similarity signal across a sliding
+window — the delta's directional stability IS the convergence metric.
 
-Early testing hit 94.1% on bert-base-uncased SST-2 in 8000 steps, matching
-or exceeding full fine-tune.
-
-Depends on [PackR](https://github.com/otherdrums/packr) (MIT) for
-FusedQuantizedAdam and the kernel loader.
-
-```bash
-pip install zpackr
-```
+No dictionaries, no reindex, no calibration, no compression, no historical state
+beyond a 60-step ring buffer of 64-bit hash signatures.
 
 ## Quick Start
 
@@ -39,104 +31,88 @@ for step, batch in enumerate(loader):
     optimizer.step()
     optimizer.zero_grad()
 
-    if step % 4 == 0:
-        for module in model.modules():
-            if hasattr(module, 'post_step'):
-                module.post_step()
+    # LSH hash computed synchronously on GPU (~1ms total)
+    for module in model.modules():
+        if hasattr(module, 'compute_hash_gpu'):
+            module.compute_hash_gpu()
 ```
 
 Or the harness:
 ```bash
 python -m tools.diagnose --task sst2 --max-steps 8000 --batch-size 16 \
-    --eval-interval 500 --post-step-interval 4 --no-velvet
+    --eval-interval 500 --no-velvet --label my_run
 ```
 
 ## Architecture
 
 ```
-Text → BERT forward/backward → delta bytes
+Text → BERT forward/backward → delta on GPU
                                   │
-                    zstd.compress() per block → ratio
+                    LSH hash: sign(delta @ projections.T)
                                   │
-            max(0, 1 - 1/(ratio × I_MAX)) → attenuation [0,1]
+         multi-scale cos_sim vs 60-step sliding window
                                   │
-            Forward: delta *= (1 - attenuation) per block
-            Gate:    if all blocks ≥ 0.9 attenuation → skip backward
+            attenuation = mean_sim × (1 - flatness)
+                                  │
+             Forward: delta *= (1 - attenuation) per block
+             Gate:    if all blocks ≥ 0.99 → skip backward
 ```
 
-**Zero-delta blocks** compress at 13,000x+ → attenuation ≈ 1.0 → fully suppressed.  
-**Non-zero delta blocks** compress at ~1.27x (bf16 entropy floor) → attenuation ~1% → train fully.  
-**Converging delta blocks** — as zstd finds more structure → ratio climbs → attenuation rises proportionally.
+**Novel blocks** have changing delta direction → low mean_sim → low attenuation → train fully.
+**Converged blocks** have stable delta direction → high mean_sim, low flatness → attenuation ≈ 1.0.
+**Diverging blocks** have varying stability across time scales → high flatness → attenuation reduced.
 
-The delta's current compressibility IS the knowledge metric.  The formula comes
-from Algorithmic Information Theory (AIT):
+### The zstd problem
 
-```python
-# I_MAX = bf16 entropy floor (measured: zstd compresses random bf16 to ~79%)
-I_MAX = 1.0 / 1.27  # ≈ 0.79
-attenuation = max(0.0, 1.0 - 1.0 / (ratio * I_MAX))
-```
+Raw bf16 bytes from Adam-optimized deltas all compress to ~1.27x regardless of
+content (the bf16 entropy floor). No compression technique — raw, prefix dict,
+or trained dict — can distinguish "known" from "novel" bf16 deltas because
+gradient noise + Adam smoothing + bf16 quantization produces bytes that look
+random to any compressor.
 
-- ratio = 1.0 (no compression, max entropy) → attenuation = 0.0 (fully active)
-- ratio = 1.27 (bf16 entropy floor) → attenuation = 0.003 (nearly fully active)
-- ratio = 5.0 (5x compression) → attenuation = 0.747 (mostly suppressed)
-- ratio = 13,000 (zero-delta) → attenuation ≈ 1.0 (fully suppressed)
+### The LSH solution
 
-The only constant is `I_MAX` — empirically measurable, theoretically grounded.
-No RATIO_FLOOR, no RATIO_CEILING, no historical tracking.
-
-### Layer Architecture
-
-Each ZPackRLinear layer stores:
-
-| Component | Location | Type | Trainable | Purpose |
-|-----------|----------|------|:---------:|---------|
-| `base_W` | GPU | bf16 | No | Frozen BERT pretrained weight |
-| `delta_salient` | GPU | bf16 | **Yes** | Only kept (salient) delta blocks |
-| `_full_delta` | CPU | bf16 | — | Authoritative full delta matrix |
-| `_zstd_delta` | CPU | bytes | — | zstd-compressed delta for checkpoint |
-| `block_mask` | — | bool[N] | — | Which delta blocks are in VRAM |
-
-**Forward**: `output = x @ (base_W + delta * (1 - attenuation))` — single cuBLAS matmul.
+LSH operates on the delta VALUES (not bytes), preserving cosine similarity in
+compact bit hashes. The sign of random projections captures the delta's
+direction, which stabilizes as the block converges. Two deltas with similar
+direction have similar hashes — 880x discrimination between converged and novel.
 
 ### Per-Step Data Flow
 
 ```
 1. Forward:       delta *= (1 - attenuation) per block → combined matmul → output
 2. Backward:      grad flows only to delta_salient (base_W is frozen)
-3. Optimizer.step() + optionally Velvet for per-layer LR adaptation
-4. Async compress: zstd compress per block in background thread → ratios
-5. Attenuation:   max(0, 1 - 1/(ratio × I_MAX)) — AIT-derived, single constant
-6. Pruning:       blocks at/above RATIO_CEILING * 0.75 evicted from delta_salient
-7. Gate:          convergence check — all blocks ≥ 0.9 → skip backward
+3. Optimizer:     FusedQuantizedAdam updates delta_salient on GPU
+4. Hash (GPU):    LSH hash → push to sliding window → multi-scale comparison
+5. Attenuation:   mean_sim × (1 - flatness) — pure function, no thresholds
+6. Gate:          convergence check — all blocks ≥ 0.99 → skip backward
 ```
 
 ### Convergence Gate
 
 Checks whether ALL blocks across ALL layers have attenuation ≥
-`ATTENUATION_SKIP_THRESHOLD` (default 0.9).  If so, backward is skipped.
+`ATTENUATION_SKIP_THRESHOLD` (default 0.99). If so, backward is skipped.
 
-Future: auto-terminate training when gate skip rate saturates.
+Hash is computed every step even when gate fires, so the window keeps evolving.
+If any block dips below threshold, the gate opens and training resumes.
 
 ### Key Design Decisions
 
-**zstd over LZ4**:  LZ4 produced ratios < 1.0 on non-zero bf16 (data inflation),
-making the AIT formula impossible.  zstd gives ratios > 1.0 (~1.27 for active
-deltas, 13,000+ for zeros).  This range makes the AIT formula work.
+**LSH over zstd/LZ4**: Compression on bf16 bytes can't distinguish known from
+novel (entropy floor). LSH on delta values gives 880x discrimination, ~1ms on
+GPU vs ~400ms CPU, with no thread complexity.
 
-**No dictionaries, no reindex, no calibration**:  The WeightDict was eliminated.
-Per-block zstd compressibility provides a clean signal with zero maintenance.
+**Sliding window over prompt table**: A 60-step ring buffer of 64-bit hashes
+(~2MB) replaces the 67K-entry per-prompt table (~2.5GB). Multi-scale comparison
+(offsets 1, 5, 10, 25, 50) captures convergence at multiple time scales.
 
-**AIT-derived formula**:  `attenuation = max(0, 1 - 1/(ratio × I_MAX))`.
-From Algorithmic Information Theory: the fraction of a block's bytes that are
-compressible equals the fraction of knowledge already encoded.  Single constant
-`I_MAX ≈ 0.79` (bf16 entropy floor), empirically measurable.
+**Pure deterministic computation**: Attenuation is `mean_sim × (1 - flatness)`.
+No thresholds, no conditionals, no historical state beyond the ring buffer.
+Every component is a pure function of current + recent state.
 
-**zstd creep characterization** (May 2026):  On a fixed batch, zstd ratios creep at
-0.001-0.009%/step (deeper layers faster).  Total creep over 300 steps: 0.18% (layer 0)
-to 1.37% (layer 11).  zstd noise floor is effectively zero (deterministic for same bytes).
-Signal is clean and persistent — no EMA or state tracking needed because the delta
-itself IS the history.
+**No pruning**: All blocks stay active on GPU, just attenuated. Pruning was
+removed in v4 because the attenuation signal alone prevents overfitting without
+the complexity of managing block masks.
 
 ## Training Harness
 
@@ -148,12 +124,12 @@ python -m tools.diagnose --task sst2 --max-steps 8000 --batch-size 16 \
 | Flag | Default | Description |
 |------|:-------:|-------------|
 | `--task` | `sst2` | GLUE task |
-| `--max-steps` | `2000` | Training steps |
-| `--eval-interval` | `500` | Steps between evals |
+| `--max-steps` | `500` | Training steps |
+| `--eval-interval` | `100` | Steps between evals |
 | `--eval-steps` | `20` | Eval batches per run |
 | `--velvet` / `--no-velvet` | on | VelvetController per-layer LR |
 | `--attenuation-skip` / `--no-attenuation-skip` | on | Convergence gate |
-| `--attenuation-skip-threshold` | `0.9` | Attenuation threshold for gate |
+| `--attenuation-skip-threshold` | `0.99` | Attenuation threshold for gate |
 | `--batch-size` | `16` | Per-GPU batch size |
 | `--lr` | `2e-5` | Learning rate |
 | `--label` | `""` | Prefix for output directory |
@@ -163,13 +139,13 @@ python -m tools.diagnose --task sst2 --max-steps 8000 --batch-size 16 \
 ### Output Structure
 
 ```
-runs/my_run_2026-05-14_124350_704b6e3/
+runs/my_run_2026-05-14_runid/
   metrics.jsonl         # per-step: loss, step_ms, gate_skipped, salience, vram
-  ratio_log.jsonl       # per-step per-block: ratio, attenuation, delta_l2
+  ratio_log.jsonl       # per-step per-block: attenuation, delta_l2
   config.json           # full TrainerConfig snapshot
   summary.json          # final stats: peak_vram_mb, final_eval_metric, gate_skip_rate
   checkpoints/
-    step_2000/
+    step_N/
       0.meta, 0.zstd, 0.mask, 0.base_W   # per-layer delta state
       trainer_state.pt                    # optimizer + Velvet
 ```
@@ -178,18 +154,21 @@ runs/my_run_2026-05-14_124350_704b6e3/
 
 | Module | Purpose |
 |--------|---------|
-| `zpackr_layer.py` | ZPackRLinear — frozen base + zstd delta, forward matmul with attenuation |
+| `zpackr_layer.py` | ZPackRLinear, DeltaSignatureDB, `compute_hash_gpu()` |
 | `config.py` | ZPackRConfig dataclass |
 | `layer_patcher.py` | `compress_model()` — replaces nn.Linear with ZPackRLinear |
 | `prompt_gate.py` | `should_skip_backward()` — convergence-driven backward skip |
 | `checkpoint.py` | Model-level save/load with zstd-compressed deltas |
+| `super_dict.py` | Optional zstd text preprocessor (archived) |
 
 ## Tunables
 
 | Constant | Default | Meaning |
 |----------|:-------:|---------|
-| `I_MAX` | `0.79` | bf16 entropy floor (1/1.27), the only constant in the AIT formula |
-| `ATTENUATION_SKIP_THRESHOLD` | `0.9` | Gate fires when all blocks ≥ this attenuation |
+| `K` (lsh_K) | `64` | LSH hash bits (higher = finer resolution, more memory) |
+| `WINDOW_SIZE` | `60` | Sliding window of hash snapshots |
+| `LSH_OFFSETS` | `(1,5,10,25,50)` | Multi-scale comparison offsets |
+| `ATTENUATION_SKIP_THRESHOLD` | `0.99` | Gate fires when all blocks ≥ this |
 
 ## License
 

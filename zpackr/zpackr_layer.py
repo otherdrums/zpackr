@@ -1,4 +1,4 @@
-"""ZPackRLinear — frozen base + LZ4-attenuated trainable delta.
+"""ZPackRLinear — frozen base + LSH-attenuated trainable delta.
 
 Drop-in replacement for nn.Linear that stores a frozen base weight plus
 a trainable delta.  Per-block attenuation prevents overfitting by suppressing
@@ -7,97 +7,147 @@ delta contribution for blocks the model has already converged on.
 Forward:  output = x @ (base_W + delta * (1 - attenuation))
              └─ frozen ─┘   └─ trainable ─┘
 
-The attenuation signal comes from DeltaAccumulator: delta bytes from every
-block at every post_step are accumulated. Current deltas are compressed
-against this accumulated history using zstd prefix dictionary mode.
-Blocks whose delta patterns match the accumulated history are "known"
-→ high compressibility → high attenuation → suppressed.
-Blocks with novel delta patterns are "novel" → low compressibility →
-low attenuation → train fully.
+The attenuation signal comes from DeltaSignatureDB: a sliding window of
+LSH hashes of each block's delta.  Multi-scale comparison (vs 1, 5, 10,
+25, 50 steps ago) produces two signals per block:
+  - mean_sim: average cosine similarity across scales (convergence level)
+  - flatness: std of cosine similarity across scales (stability)
+  - attenuation = mean_sim * (1 - flatness)
 
-AIT formula: attenuation = max(0, 1 - 1/(ratio × I_MAX))
-  I_MAX = 1/1.27 ≈ 0.79 (bf16 entropy floor, measured)
+Pure deterministic computation.  No thresholds.  No zstd in hot path.
 """
 
 import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import zstandard as zstd
-import threading
+from collections import deque
 
 
 BLOCK_SIZE = 256
 
-# AIT-derived constant: bf16 entropy floor.
-# I_MAX = 1 / ratio_for_random_bf16
-# Measured: zstd compresses random bf16 to ~79% (ratio ~1.27).
-# Used in: attenuation = max(0, 1 - 1/(ratio * I_MAX))
-I_MAX = 1.0 / 1.27  # ≈ 0.7874
-
 # Gate threshold: if ALL blocks across ALL layers have attenuation >= this,
 # the prompt is fully converged and backward can be skipped.
-ATTENUATION_SKIP_THRESHOLD = 0.9
+ATTENUATION_SKIP_THRESHOLD = 0.99
+
+# Multi-scale comparison offsets (in steps)
+LSH_OFFSETS = (1, 5, 10, 25, 50)
 
 
-class DeltaAccumulator:
-    """Accumulates delta byte chunks and compresses against them using zstd prefix mode.
+class DeltaSignatureDB:
+    """Sliding window of LSH hashes for per-block convergence detection.
 
-    All ZPackRLinear layers share a single DeltaAccumulator. Each post_step,
-    layers append their delta bytes. Compression uses accumulated bytes as a
-    zstd prefix dictionary — blocks that match accumulated patterns compress
-    well (known), blocks that don't compress poorly (novel).
+    Each post_step, all block deltas are hashed via LSH (sign of random
+    projections) and appended to a ring buffer.  Multi-scale comparison
+    against past hashes produces mean_sim and flatness signals.
+
+    Attenuation = mean_sim * (1 - flatness).
+      - Converged + stable → ~1.0 (fully attenuated)
+      - Learning + varying → ~0.8 (partially attenuated)
+      - Novel (no history) → 0.0 (fully active)
     """
 
-    def __init__(self, max_bytes: int = 500_000_000):
-        self._chunks: list = []
-        self._total_bytes = 0
-        self._max_bytes = max_bytes
-        self._prefix_cache = None  # cached concatenated bytes
-        self._prefix_dirty = True
+    _projection_cache: dict = {}  # class-level: (K, block_elements) → bf16 GPU tensor
 
-    def append(self, block_bytes: bytes):
-        """Append delta bytes to the accumulator."""
-        if len(block_bytes) >= 256:
-            self._chunks.append(block_bytes)
-            self._total_bytes += len(block_bytes)
-            self._prefix_dirty = True
-            # Evict oldest if over cap
-            while self._total_bytes > self._max_bytes and len(self._chunks) > 1:
-                removed = self._chunks.pop(0)
-                self._total_bytes -= len(removed)
+    def __init__(self, block_elements: int, num_blocks: int,
+                 K: int = 64, window_size: int = 60, seed: int = 42):
+        """
+        Args:
+            block_elements: number of bf16 elements per block (block_size * out_features)
+            num_blocks: number of blocks in this layer
+            K: number of LSH projection bits (more = higher resolution)
+            window_size: number of hash snapshots to keep
+            seed: deterministic seed for projection vectors
+        """
+        self.K = K
+        self.num_blocks = num_blocks
+        self.window_size = window_size
+        self.block_elements = block_elements
 
-    @property
-    def prefix_bytes(self) -> bytes:
-        """Cached concatenated prefix bytes for zstd prefix dict."""
-        if self._prefix_dirty:
-            self._prefix_cache = b"".join(self._chunks)
-            self._prefix_dirty = False
-        return self._prefix_cache
+        # Sliding window of hash snapshots: deque of [num_blocks, K] uint8 tensors
+        self._window: deque = deque(maxlen=window_size)
 
-    @property
-    def is_empty(self) -> bool:
-        return len(self._chunks) == 0
+    @classmethod
+    def get_gpu_projections(cls, block_elements: int, K: int = 64, seed: int = 42) -> torch.Tensor:
+        """Get or create shared GPU projection matrix for a given block size.
 
-    def compress(self, block_bytes: bytes) -> float:
-        """Compress a block against accumulated prefix. Returns ratio."""
-        prefix = self.prefix_bytes
-        if not prefix:
-            # No history — use raw zstd (entropy floor)
-            compressed = zstd.ZstdCompressor(level=1).compress(block_bytes)
-            return len(block_bytes) / max(len(compressed), 1)
-        dict_obj = zstd.ZstdCompressionDict(prefix,
-                                             dict_type=zstd.DICT_TYPE_RAWCONTENT)
-        cctx = zstd.ZstdCompressor(level=1, dict_data=dict_obj)
-        compressed = cctx.compress(block_bytes)
-        return len(block_bytes) / max(len(compressed), 1)
+        Returns a [K, block_elements] bf16 tensor cached on GPU, shared across
+        all layers with the same block_elements.
+        """
+        key = (K, block_elements)
+        if key not in cls._projection_cache:
+            gen = torch.Generator().manual_seed(seed)
+            proj = torch.randn(K, block_elements, generator=gen)
+            proj = proj / proj.norm(dim=1, keepdim=True)
+            cls._projection_cache[key] = proj.to(torch.float32).cuda()
+        return cls._projection_cache[key]
+
+    def push(self, hashes: torch.Tensor):
+        """Append hash snapshot to the window."""
+        self._window.append(hashes.clone())
+
+    def hash_blocks(self, blocks: torch.Tensor) -> torch.Tensor:
+        """LSH hash all blocks.  Device-agnostic.
+
+        Uses shared GPU projections when blocks are on CUDA,
+        falls back to CPU copy when blocks are on CPU.
+
+        Args:
+            blocks: [num_blocks, block_elements] bf16 tensor
+
+        Returns:
+            [num_blocks, K] uint8 tensor (sign bits)
+        """
+        proj = self.get_gpu_projections(blocks.shape[1], self.K)
+        if blocks.device.type == 'cpu':
+            proj = proj.cpu()
+        result = blocks.float() @ proj.t()
+        return (result > 0).to(torch.uint8)
+
+    def compute_attenuation(self, current_hashes: torch.Tensor) -> torch.Tensor:
+        """Compute per-block attenuation from multi-scale comparison.
+
+        Args:
+            current_hashes: [num_blocks, K] uint8 tensor
+
+        Returns:
+            [num_blocks] float32 tensor, values in [0, 1]
+            0.0 = fully active (novel), 1.0 = fully suppressed (converged)
+        """
+        n_offsets = 0
+        dev = current_hashes.device
+        sim_sum = torch.zeros(self.num_blocks, device=dev)
+        sim_sqs = torch.zeros(self.num_blocks, device=dev)
+
+        window_len = len(self._window)
+        for off in LSH_OFFSETS:
+            if off > window_len:
+                break
+            stored = self._window[-off].to(device=dev)
+            matching = (current_hashes == stored).float().mean(dim=1)
+            cos_sim = 2 * matching - 1
+            sim_sum += cos_sim
+            sim_sqs += cos_sim * cos_sim
+            n_offsets += 1
+
+        if n_offsets == 0:
+            return torch.zeros(self.num_blocks, device=dev)
+
+        mean_sim = sim_sum / n_offsets
+        variance = sim_sqs / n_offsets - mean_sim * mean_sim
+        flatness = torch.sqrt(torch.clamp(variance, min=0.0))
+
+        attenuation = mean_sim * (1.0 - flatness)
+        return torch.clamp(attenuation, 0.0, 1.0)
 
 
 class ZPackRLinear(nn.Module):
-    """Linear layer with frozen base + zstd-compressed trainable delta.
+    """Linear layer with frozen base + LSH-attenuated trainable delta.
 
     CPU/pinned (authoritative):
         _full_delta:      torch.Tensor [in, out] bf16   full delta matrix
-        _zstd_delta:      bytes                          zstd-compressed delta
+        _zstd_delta:      bytes                          zstd-compressed delta (checkpoint only)
 
     GPU/VRAM:
         base_W:           torch.Tensor [in, out] bf16    frozen pretrained weight
@@ -106,7 +156,7 @@ class ZPackRLinear(nn.Module):
         bias:             torch.Tensor [out] bf16 (optional)
     """
 
-    def __init__(self, in_features, out_features, bias=True):
+    def __init__(self, in_features, out_features, bias=True, lsh_K=64, lsh_window=60):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
@@ -130,126 +180,58 @@ class ZPackRLinear(nn.Module):
             torch.zeros(out_features, dtype=torch.bfloat16)
         ) if bias else None
 
-        self._full_delta = None       # [in, out] on CPU — authoritative delta
-        self._zstd_delta = None       # zstd-compressed delta bytes (checkpoint)
-        self._salient_count = self.num_blocks  # cached, updated in post_step
+        self._full_delta = None       # [in, out] on CPU — populated only during checkpoint save/load
+        self._zstd_delta = None       # zstd-compressed delta bytes (checkpoint only)
+        self._salient_count = self.num_blocks  # cached
 
         # Cached kept-block indices (updated when mask changes)
         self._kept_indices = torch.arange(self.num_blocks, dtype=torch.long)
 
-        # Ratio cache for diagnostic tools — invalidated on post_step
+        # Ratio cache for diagnostic tools — invalidated on each hash
         self._ratio_cache = None
 
-        # Per-block attenuation factors [0,1], computed from AIT formula.
+        # Per-block attenuation factors [0,1].
         # 0.0 = fully active (novel), 1.0 = fully suppressed (known).
         self._attenuation_factors = None
-        self._block_gaps = None  # cached per-block ratios
+        self._block_gaps = None  # cached per-block scores (for diagnostics)
 
         # Cached scatter indices for fused forward matmul
         self._scatter_indices = None  # pre-built for index_add_ in forward
 
-        # Async compression — double-buffer attenuation
-        self._attenuation_lock = threading.Lock()
-        self._attenuation_pending = None  # computed by background thread
-        self._attenuation_thread = None
+        # Per-layer LSH signature database (sliding window + multi-scale comparison)
+        block_elements = self.block_size * out_features
+        self._sig_db = DeltaSignatureDB(
+            block_elements=block_elements,
+            num_blocks=self.num_blocks,
+            K=lsh_K,
+            window_size=lsh_window,
+        )
 
-        # Shared DeltaAccumulator (set by harness after creation)
-        self._accumulator: DeltaAccumulator = None
+    @torch.no_grad()
+    def compute_hash_gpu(self):
+        """Compute LSH hash on GPU directly from delta_salient, update attenuation.
 
-    def _compress_async(self):
-        """Compress delta blocks against accumulated prefix in background thread.
-
-        Called after stage_delta_async() snapshots the CPU delta.
-        Uses DeltaAccumulator prefix compression for temporal pattern matching.
-        Sets self._attenuation_pending and self._block_gaps when done.
+        Called after optimizer.step().  Uses shared GPU projection matrices,
+        avoiding any GPU→CPU copy of the delta.  Only the tiny hash result
+        (48 bytes per layer) is copied to CPU for the sliding window.
         """
-        if self._full_delta is None:
-            with self._attenuation_lock:
-                self._attenuation_pending = None
-                self._block_gaps = None
-            return
+        n_blocks = self.num_blocks
+        n_pad = n_blocks * self.block_size - self.in_features
+        padded = F.pad(self.delta_salient, (0, 0, 0, n_pad), mode='constant', value=0)
+        blocks = padded.reshape(n_blocks, self.block_size * self.out_features)
 
-        import numpy as np
-        delta_np = self._full_delta.view(torch.uint8).contiguous().view(-1).numpy()
-        block_el_bytes = self.block_size * self.out_features * 2
-        ratios = []
+        current_hashes = self._sig_db.hash_blocks(blocks)
 
-        acc = self._accumulator
-        if acc is None:
-            # Fallback: raw zstd (no accumulator attached yet)
-            cctx = zstd.ZstdCompressor(level=1)
-            for blk in range(self.num_blocks):
-                byte_start = blk * block_el_bytes
-                byte_end = min(byte_start + block_el_bytes, delta_np.nbytes)
-                if byte_end <= byte_start:
-                    ratios.append(1.0)
-                    continue
-                blk_arr = delta_np[byte_start:byte_end]
-                if not np.any(blk_arr):
-                    ratios.append(1.0)
-                    continue
-                compressed = cctx.compress(blk_arr.tobytes())
-                ratios.append(len(blk_arr) / max(len(compressed), 1))
-        else:
-            # Prefix compression against accumulated history
-            for blk in range(self.num_blocks):
-                byte_start = blk * block_el_bytes
-                byte_end = min(byte_start + block_el_bytes, delta_np.nbytes)
-                if byte_end <= byte_start:
-                    ratios.append(1.0)
-                    continue
-                blk_arr = delta_np[byte_start:byte_end]
+        # Compute attenuation BEFORE pushing current hash to window
+        attenuation = self._sig_db.compute_attenuation(current_hashes)
 
-                # Cold-start protection: near-zero delta → no attenuation
-                l2 = float(np.sqrt(np.sum(blk_arr.astype(np.float32) ** 2)))
-                if l2 < 1e-4:
-                    ratios.append(1.0)
-                    continue
+        # Push current hash into window after computing attenuation
+        self._sig_db.push(current_hashes)
 
-                if not np.any(blk_arr):
-                    ratios.append(1.0)
-                    continue
-
-                # Prefix compression: compress against accumulated history
-                blk_bytes = blk_arr.tobytes()
-                ratios.append(acc.compress(blk_bytes))
-
-                # Append delta bytes to accumulator (after compressing)
-                acc.append(blk_bytes)
-
-        # AIT-derived attenuation: 1 - 1/(ratio * I_MAX)
-        factors = [max(0.0, 1.0 - 1.0 / (r * I_MAX)) for r in ratios]
-
-        with self._attenuation_lock:
-            self._attenuation_pending = factors
-            self._block_gaps = ratios
-
-    def swap_attenuation(self):
-        """Swap in attenuation factors computed by background thread.
-
-        Called by harness before next forward.
-        If pending factors are ready, they become active and pruning
-        is applied based on the current ratios.
-        """
-        with self._attenuation_lock:
-            if self._attenuation_pending is not None:
-                self._attenuation_factors = self._attenuation_pending
-                self._attenuation_pending = None
-
-                # Pruning: blocks with high ratio are fully known → prune
-                if self._block_gaps is not None:
-                    use_threshold = 6.0  # ratio threshold for pruning
-                    new_mask = torch.zeros(self.num_blocks, dtype=torch.bool)
-                    for blk in range(self.num_blocks):
-                        new_mask[blk] = self._block_gaps[blk] < use_threshold
-
-                    old_kept = self._salient_count
-                    self.block_mask.copy_(new_mask)
-                    self._salient_count = int(new_mask.sum().item())
-                    if self._salient_count != old_kept:
-                        self._rebuild_delta_salient()
-
-                self._ratio_cache = None
+        self._attenuation_factors = attenuation.tolist()
+        self._block_gaps = self._attenuation_factors
+        self._zstd_delta = None
+        self._ratio_cache = None
 
     # ── Forward ──
 
@@ -338,105 +320,19 @@ class ZPackRLinear(nn.Module):
 
         W.index_add_(0, self._scatter_indices, d_rows)
 
-    # ── post_step — delta salience update with deterministic attenuation ──
+    # ── post_step — compute hash and update attenuation ──
 
     @torch.no_grad()
     def post_step(self, threshold: float = None, calibration_multiplier: float = 0.01):
-        """Update delta salience and attenuation factors.
-
-        Compresses every block's full delta bytes against accumulated prefix,
-        derives attenuation via AIT formula, and updates block mask for pruning.
-        Also appends delta bytes to accumulator for future prefix compression.
-        """
-        self._sync_full_delta()
-
-        delta_np = self._full_delta.view(torch.uint8).contiguous().view(-1).numpy()
-        block_el_bytes = self.block_size * self.out_features * 2
-        ratios = []
-        acc = self._accumulator
-
-        for blk in range(self.num_blocks):
-            byte_start = blk * block_el_bytes
-            byte_end = min(byte_start + block_el_bytes, delta_np.nbytes)
-            if byte_end <= byte_start:
-                ratios.append(1.0)
-                continue
-
-            blk_bytes = delta_np[byte_start:byte_end].tobytes()
-
-            # Zero-delta / cold-start: no attenuation
-            if blk_bytes == b'\x00' * len(blk_bytes):
-                ratios.append(1.0)
-                continue
-
-            # Prefix compression against accumulated history
-            if acc is not None:
-                ratios.append(acc.compress(blk_bytes))
-                acc.append(blk_bytes)
-            else:
-                compressed = zstd.compress(blk_bytes)
-                ratios.append(len(blk_bytes) / max(len(compressed), 1))
-
-        # AIT-derived attenuation: 1 - 1/(ratio * I_MAX)
-        self._attenuation_factors = [
-            max(0.0, 1.0 - 1.0 / (r * I_MAX))
-            for r in ratios
-        ]
-
-        # Pruning: blocks with high ratio are fully known → prune
-        use_threshold = threshold if threshold is not None else 6.0
-
-        new_mask = torch.zeros(self.num_blocks, dtype=torch.bool)
-        for blk in range(self.num_blocks):
-            new_mask[blk] = ratios[blk] < use_threshold
-
-        old_kept = self._salient_count
-        self.block_mask.copy_(new_mask)
-        self._salient_count = int(new_mask.sum().item())
-        if self._salient_count != old_kept:
-            self._rebuild_delta_salient()
-
-        self._zstd_delta = None
-        self._ratio_cache = None
+        """Update attenuation factors from GPU hash."""
+        self.compute_hash_gpu()
 
     @property
     def salient_count(self) -> int:
         return self._salient_count
 
-    @torch.no_grad()
-    def stage_delta_async(self, stream=None):
-        """Snapshot delta_salient to CPU for background compression.
-
-        Stores a CPU copy in _staged_cpu for use by apply_staged_delta().
-        No GPU staging buffer needed — direct .cpu() call.
-        """
-        self._staged_cpu = self.delta_salient.cpu()
-
-    def apply_staged_delta(self):
-        """Consume staged CPU delta data, merge into _full_delta.
-
-        Avoids the GPU→CPU copy that _sync_full_delta normally does.
-        """
-        if not hasattr(self, '_staged_cpu') or self._staged_cpu is None:
-            self._sync_full_delta()
-            return
-        if self._full_delta is None:
-            self._full_delta = torch.zeros(self.in_features, self.out_features, dtype=torch.bfloat16)
-        if self._salient_count == self.num_blocks:
-            self._full_delta.copy_(self._staged_cpu)
-        else:
-            kept = self._kept_indices
-            for view_idx, blk_idx in enumerate(kept.tolist()):
-                vs = view_idx * self.block_size
-                ve = vs + self.block_size
-                fs = int(blk_idx) * self.block_size
-                fe = min(fs + self.block_size, self.in_features)
-                rows = fe - fs
-                self._full_delta[fs:fs + rows] = self._staged_cpu[vs:vs + rows]
-        self._staged_cpu = None
-
     def get_block_ratios(self):
-        """Return per-block compression ratios, delta L2 norms, and attenuation.
+        """Return per-block attenuation scores, delta L2 norms, and diagnostics.
 
         Called by diagnostic tools during post_step.  Cached until the next
         post_step (which invalidates via _ratio_cache = None).
@@ -444,101 +340,36 @@ class ZPackRLinear(nn.Module):
         if self._ratio_cache is not None:
             return self._ratio_cache
 
-        # Fast path: use cached post_step data, no GPU sync
-        if self._block_gaps is not None:
-            gaps = self._block_gaps
-            attenuations = self._attenuation_factors
-            if attenuations is None:
-                attenuations = [
-                    max(0.0, 1.0 - 1.0 / (g * I_MAX))
-                    for g in gaps
-                ]
+        attenuations = self._attenuation_factors
+        if attenuations is None:
+            attenuations = [0.0] * self.num_blocks
 
-            delta_l2 = [0.0] * self.num_blocks
-            if self._full_delta is not None:
-                for blk in range(self.num_blocks):
-                    fs = blk * self.block_size
-                    fe = min(fs + self.block_size, self.in_features)
-                    if fe > fs:
-                        delta_l2[blk] = self._full_delta[fs:fe, :].float().norm().item()
-
-            self._ratio_cache = {
-                'ratios': list(gaps),
-                'delta_l2': delta_l2,
-                'block_gaps': list(gaps),
-                'attenuation_scores': attenuations,
-                'salient_count': self._salient_count,
-                'num_blocks': self.num_blocks,
-            }
-            return self._ratio_cache
-
-        # Slow path: no post_step data yet, recompute from fresh delta
-        self._sync_full_delta()
-
-        delta_np = self._full_delta.contiguous().view(torch.uint8).view(-1).numpy()
-        block_el_bytes = self.block_size * self.out_features * 2
-        ratios = [1.0] * self.num_blocks
         delta_l2 = [0.0] * self.num_blocks
-
+        delta_cpu = self.delta_salient.cpu()
         for blk in range(self.num_blocks):
-            byte_start = blk * block_el_bytes
-            byte_end = min(byte_start + block_el_bytes, delta_np.nbytes)
-            if byte_end <= byte_start:
-                continue
-            blk_bytes = delta_np[byte_start:byte_end].tobytes()
-            acc = self._accumulator
-            if acc is not None:
-                ratios[blk] = acc.compress(blk_bytes)
-            else:
-                compressed = zstd.compress(blk_bytes)
-                ratios[blk] = len(blk_bytes) / max(len(compressed), 1)
-
             fs = blk * self.block_size
             fe = min(fs + self.block_size, self.in_features)
             if fe > fs:
-                delta_l2[blk] = self._full_delta[fs:fe, :].float().norm().item()
-
-        attenuations = [
-            max(0.0, 1.0 - 1.0 / (r * I_MAX))
-            for r in ratios
-        ]
+                delta_l2[blk] = delta_cpu[fs:fe, :].float().norm().item()
 
         self._ratio_cache = {
-            'ratios': ratios,
+            'ratios': list(attenuations),
             'delta_l2': delta_l2,
-            'block_gaps': ratios,
-            'attenuation_scores': attenuations,
+            'block_gaps': list(attenuations),
+            'attenuation_scores': list(attenuations),
             'salient_count': self._salient_count,
             'num_blocks': self.num_blocks,
         }
         return self._ratio_cache
 
     def _sync_full_delta(self):
-        """Merge current delta_salient into _full_delta on CPU.
+        """Copy delta_salient from GPU to CPU _full_delta.
 
-        Uses staged CPU data when available (from stage_delta_async),
-        avoiding a redundant GPU→CPU copy.
+        Only called during checkpoint save/load, not every step.
         """
-        if hasattr(self, '_staged_cpu') and self._staged_cpu is not None:
-            delta_cpu = self._staged_cpu
-            self._staged_cpu = None
-        else:
-            delta_cpu = self.delta_salient.cpu()
-
         if self._full_delta is None:
             self._full_delta = torch.zeros(self.in_features, self.out_features, dtype=torch.bfloat16)
-
-        if self._salient_count == self.num_blocks:
-            self._full_delta.copy_(delta_cpu)
-        else:
-            kept = self._kept_indices
-            for view_idx, blk_idx in enumerate(kept.tolist()):
-                vs = view_idx * self.block_size
-                ve = vs + self.block_size
-                fs = int(blk_idx) * self.block_size
-                fe = min(fs + self.block_size, self.in_features)
-                rows = fe - fs
-                self._full_delta[fs:fs + rows] = delta_cpu[vs:vs + rows]
+        self._full_delta.copy_(self.delta_salient.cpu())
 
     def _rebuild_delta_salient(self):
         if self._full_delta is None:
@@ -575,8 +406,7 @@ class ZPackRLinear(nn.Module):
     @torch.no_grad()
     def export_merged(self) -> torch.Tensor:
         """Return merged weights: base_W + delta (as fp16), suitable for nn.Linear."""
-        self._sync_full_delta()
-        return (self.base_W + self._full_delta.to(torch.bfloat16)).t().contiguous()
+        return (self.base_W + self.delta_salient.to(torch.bfloat16)).t().contiguous()
 
     # ── Checkpoint ──
 
@@ -584,11 +414,11 @@ class ZPackRLinear(nn.Module):
         import os
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
 
-        self._sync_full_delta()
+        # Copy delta to CPU once (only at checkpoint time)
+        delta_cpu = self.delta_salient.cpu()
 
-        if self._zstd_delta is None and self._full_delta is not None:
-            raw = self._full_delta.view(torch.uint8).contiguous().view(-1).numpy().tobytes()
-            self._zstd_delta = zstd.compress(raw)
+        raw = delta_cpu.view(torch.uint8).contiguous().view(-1).numpy().tobytes()
+        zstd_compressed = zstd.compress(raw)
 
         torch.save({
             "in_features": self.in_features,
@@ -600,9 +430,8 @@ class ZPackRLinear(nn.Module):
 
         torch.save(self.base_W.data, path + ".base_W")
 
-        if self._zstd_delta is not None:
-            with open(path + ".zstd", "wb") as f:
-                f.write(self._zstd_delta)
+        with open(path + ".zstd", "wb") as f:
+            f.write(zstd_compressed)
 
         torch.save(self.block_mask, path + ".mask")
 
@@ -661,7 +490,12 @@ class ZPackRLinear(nn.Module):
         inst._attenuation_factors = None
         inst._zstd_delta = None
         inst._ratio_cache = None
-        inst._accumulator = None
+        # Initialize LSH signature database
+        block_elements = inst.block_size * inst.out_features
+        inst._sig_db = DeltaSignatureDB(
+            block_elements=block_elements,
+            num_blocks=inst.num_blocks,
+        )
         return inst
 
     # ── Conversion from nn.Linear ──

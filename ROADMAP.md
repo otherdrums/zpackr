@@ -1,16 +1,16 @@
-# ZPackR Implementation Guide — v3.0 (LZ4)
+# ZPackR Implementation Guide — v4 (LSH)
 
 Target repos:
 - `github.com/otherdrums/packr` — PackRLinear, FusedQuantizedAdam, VelvetController (MIT)
-- `github.com/otherdrums/zpackr` — ZPackRLinear, LZ4 attenuation, convergence gate (MIT)
+- `github.com/otherdrums/zpackr` — ZPackRLinear, LSH attenuation, convergence gate (MIT)
 - `github.com/otherdrums/packr-research` — training harness, diagnostics, sweep tools (AGPL)
 
 ## The Headline
 
-> "Per-block LZ4 compressibility of the weight delta tells you whether the
-> model already encodes that block's patterns.  Known blocks get attenuated
-> in the forward pass and their gradients naturally decay.  Overfitting
-> becomes structurally impossible at the block level."
+> "Per-block LSH cosine similarity of the delta across a sliding window tells you
+> whether the model has converged. Known blocks get attenuated in the forward
+> pass and their gradients naturally decay. Local minima are escaped via
+> continuous, reversible attenuation."
 
 ### What ZPackR + Velvet Eliminate
 
@@ -20,67 +20,71 @@ Target repos:
 | How many epochs to train | Convergence gate | `should_skip_backward()` when all blocks fully attenuated |
 | Knowing when to stop | Convergence gate | Auto-termination when gate skip rate saturates (future) |
 | Per-layer learning rates | Velvet per-group granularity | Saturated groups get min_multiplier; hungry groups get max_multiplier |
-| Dictionary maintenance | LZ4 stateless compression | No reindex, no dictionary training, no state to manage |
-| Threshold calibration | Fixed constants | `RATIO_FLOOR=1.0`, `RATIO_CEILING=8.0` derived from data |
+| Compression parameter tuning | LSH sliding window | No dictionaries, no levels, no calibration — fixed random projections |
 
 ---
 
-## Architecture — Frozen Base + LZ4 Delta
+## Architecture — Frozen Base + LSH Attenuation
 
 ZPackRLinear stores a frozen BERT pretrained weight matrix and a trainable
-delta.  The delta is processed in blocks (256 elements each, matching
-FusedQuantizedAdam's block size).  Each post_step, the delta bytes are
-compressed with LZ4 and the compression ratio maps to a per-block attenuation
-factor applied in the next forward pass.
+delta. The delta is processed in blocks (256 elements each). Each step, all
+block deltas are LSH-hashed on GPU and compared against a sliding window
+of past hashes using multi-scale offsets (1, 5, 10, 25, 50 steps ago).
 
 ```
-Text → BERT forward/backward → delta bytes
+Text → BERT forward/backward → delta on GPU
                                   │
-                    LZ4.block.compress() per block → ratio
+                    LSH hash (sign of random projections)
                                   │
-            clamp((ratio - 1.0) / 7.0, 0, 1) → attenuation [0,1]
+         multi-scale cos_sim vs window: mean_sim * (1 - flatness)
                                   │
-         Forward: output = x @ (base_W + delta * (1 - attenuation))
+        Forward: output = x @ (base_W + delta * (1 - attenuation))
 ```
 
-### Why LZ4
+### Why LSH over Compression
 
-| Property | zstd + WeightDict (v2) | LZ4 (v3) |
-|----------|----------------------|----------|
-| Per-block speed | ~1-3 ms | ~0.003 ms |
-| State required | Evolving dictionary + periodic reindex | None — stateless |
-| Zero-delta ratio | 255x | 255x |
-| Non-zero delta ratio | ~1.0x | ~1.0x |
-| Signal sharpness | Blurred by stale dictionary patterns | Clean — always current bytes |
-| Dependencies | zstandard, custom WeightDict class | lz4 (single call) |
-| Maintenance cost | Reindex ~1900 new patterns per cycle | Zero |
+| Property | zstd (v3) | LSH (v4) |
+|----------|-----------|----------|
+| Signal location | Byte-level (noisy bf16) | Value-level (vector directions) |
+| Discrimination | ~1x (all deltas look random) | 880x (converged vs novel) |
+| Computation | CPU matmul (~400ms/step) | GPU matmul (~1ms/step) |
+| State | None | 60-step ring buffer of 64-bit hashes |
+| Dependencies | zstandard | torch only |
+| Memory | 108MB GPU→CPU copy/step | 0 copy (stays on GPU) |
 
-The v2 WeightDict accumulated delta patterns at reindex to provide a "memory" of
-training history.  In practice, this memory didn't improve signal discrimination —
-all non-zero deltas compressed at ~1.3x regardless of whether the dictionary had
-seen those patterns before.  The reindex added complexity without adding signal.
+### The zstd problem (why it couldn't work)
 
-LZ4 gives identical zero-vs-nonzero discrimination (255x vs ~1.0x) in a fraction
-of the time, with no state, no dictionary, and no periodic maintenance.
+Raw bf16 bytes from Adam-optimized deltas compress at ~1.27x regardless of
+content. This is the bf16 entropy floor — random bf16 data always compresses
+to this ratio. No compression technique (raw, prefix dict, trained dict) can
+distinguish "known" from "novel" patterns because gradient noise + Adam
+smoothing + bf16 quantization produces bytes that look random to any
+compressor.
 
-### Attenuation Constants
+### The LSH solution
+
+LSH (sign of random projections on the delta VALUES, not bytes) preserves
+cosine similarity in compact bit hashes. Two deltas with similar direction
+have similar hashes. This works because the delta's direction stabilizes as
+the block converges, even though the bytes remain noisy.
+
+### Attenuation Formula
 
 ```python
-RATIO_FLOOR = 1.0   # Below this, block is fully novel (attenuation = 0)
-RATIO_CEILING = 8.0  # At/above this, block is fully known (attenuation = 1)
-ATTENUATION_SKIP_THRESHOLD = 0.9  # Gate fires when all blocks ≥ this
+cos_sim = 2 * matching_bits / K - 1       # per offset in (1, 5, 10, 25, 50)
+mean_sim = mean(cos_sim across offsets)    # convergence level
+flatness = std(cos_sim across offsets)     # stability across time scales
+attenuation = mean_sim * (1 - flatness)    # pure function, no thresholds
 ```
 
-Derived from ratio distribution analysis on SST-2 (2000 steps, no gate).
-With gate enabled, zero-delta blocks stay at 255x (attenuation 1.0) while
-trained blocks stay at ~1.0-1.3x (attenuation ~0-0.04).  The `RATIO_CEILING`
-of 8.0 gives generous headroom — a trained block would need a ratio of 8.0
-to be fully attenuated, which never happens with bf16 bytes.
+- Converged + stable → ~1.0 (fully attenuated)
+- Learning + varying → ~0.8 (partially attenuated)
+- Novel (no history) → 0.0 (fully active)
 
 ### Convergence Gate
 
 ```python
-def should_skip_backward(zpl_layers, threshold=0.9) -> bool:
+def should_skip_backward(zpl_layers, threshold=0.99):
     """Return True if all blocks across all layers have attenuation >= threshold."""
     for _, module in zpl_layers:
         if module._attenuation_factors is None:
@@ -90,84 +94,67 @@ def should_skip_backward(zpl_layers, threshold=0.9) -> bool:
     return True
 ```
 
-Called every step before backward.  Uses cached attenuation factors from the
-last post_step (stale by at most `post_step_interval` steps — negligible).
-Future: auto-terminate training when gate skip rate exceeds a threshold (e.g. 95%).
+Hash is computed every step (even when gate fires) so the window keeps
+evolving. If any block dips below threshold, the gate opens and training
+resumes.
 
 ---
 
 ## Implementation Notes
 
-### Frozen Base + LZ4 Delta
+### Frozen Base + LSH Delta
 
 Implemented as frozen BERT pretrained `base_W` (bf16, requires_grad=False) +
-trainable `delta_salient` (bf16).  Forward is a single cuBLAS matmul:
+trainable `delta_salient` (bf16). Forward is a single cuBLAS matmul:
 
 ```python
 W = base_W + delta * (1 - attenuation)  # fused in one tensor
 output = x @ W
 ```
 
-This is more like a full-rank adapter.  The base matmul uses optimized cuBLAS.
-Delta starts as zeros — all blocks novel, all kept.  LZ4 gives sharp zero-vs-nonzero
-discrimination.  VRAM savings from delta pruning.
+### GPU Hash Computation
+
+After `optimizer.step()`, `compute_hash_gpu()` is called synchronously:
+
+```python
+@torch.no_grad()
+def compute_hash_gpu(self):
+    padded = F.pad(delta_salient, (0, 0, 0, pad_rows))
+    blocks = padded.reshape(n_blocks, block_size * out_features)
+    proj = DeltaSignatureDB.get_gpu_projections(block_elements)
+    hash = (blocks.float() @ proj.t() > 0).to(torch.uint8)
+    self._sig_db.push(hash)
+    attenuation = self._sig_db.compute_attenuation(hash)
+    self._attenuation_factors = attenuation.tolist()
+```
+
+Two shared projection matrices on GPU (120MB total):
+- `[K, 256*3072]` for intermediate layers (96MB)
+- `[K, 256*768]` for output layers (24MB)
 
 ### Forward Speed Optimizations
 
 - **base_W stored as bf16** — eliminates per-forward dtype conversion
 - **Pre-cast x to bf16 once** at the top of forward
-- **Cached salient_count** — updated in post_step, avoids GPU sync per step
-- **Guarded `.to(device)` on delta** — no-op kernel launch eliminated
-- **Activation memory freed** after bf16 cast (`del x`)
-
-### Velvet Batch GPU Sync (packr)
-
-VelvetController syncs once per step instead of once per parameter.
-Collects all v_mean GPU scalars, single `torch.cuda.synchronize()`,
-then `.item()` locally.  Reduces ~200 GPU syncs/step to 1.
-
-### Decode Kernel Optimizations (packr, shared with PackR mode)
-
-- **Decode kernel in backward** — eliminates int64 intermediate (~19 MB/layer)
-- **Fused LUT gradient kernel** — single-pass bincount+scatter_add via Triton
-- **Async W_p prefetch** — offload copies on dedicated CUDA stream
-
-### ZPackR Forward Path Optimizations
-
-- **Cached kept-block indices** — `block_mask.nonzero()` was called every forward
-- **Scatter indices cached** — rebuilt lazily when mask changes
-- **Single cuBLAS matmul** — base_W + delta combined before matmul
-
-### Offload Path Optimizations (packr)
-
-- **Async W_p prefetch** on dedicated CUDA stream
-- **Clone elimination** in evict_wp and register_wp
+- **Cached salient_count** — no GPU sync per step
+- **No GPU→CPU delta copy** — hash computed directly from GPU delta
 
 ---
 
 ## Performance Benchmarks
 
-All runs on BERT-base, SST-2, batch_size=16, sm_75 (GTX 1650).  May 2026.
+All runs on BERT-base, SST-2, batch_size=16, sm_75 (GTX 1650). May 2026.
 
 | Method | ms/step | VRAM peak | Accuracy | Notes |
 |--------|--------:|----------:|---------:|-------|
 | Standard BERT | 838ms | 1073MB | — | baseline |
 | PackR (v1) | **802ms** | 1142MB | 89.7% | matches standard BERT |
 | ZPackR (v2, zstd + WeightDict) | 1264ms | 1176MB | 94.1% | single cuBLAS matmul |
-| ZPackR (v3, LZ4) | — | — | — | pending benchmarks |
+| ZPackR (v4, LSH K=64) | ~1400ms | 1439MB | 91.9%+ (running) | GPU hash, no thread |
 
-### Optimizations Applied
-
-| Optimization | Impact | Where |
-|-------------|--------|-------|
-| Decode kernel in backward | Eliminates int64 intermediate (~19MB/layer) | `autograd.py` |
-| Fused LUT gradient kernel | Single-pass bincount+scatter_add via Triton | `kernel.py` |
-| Cached kept indices | Avoids `block_mask.nonzero()` every forward | `zpackr_layer.py` |
-| Delta variance gating | Skip LZ4 compression for unchanged blocks (15% threshold) | `zpackr_layer.py` |
-| Fused forward matmul | Single cuBLAS matmul replaces base+delta dual launch | `zpackr_layer.py` |
-| Velvet batched sync | 1 GPU sync instead of ~200 per-param `.item()` | `velvet.py` |
-| Async W_p prefetch | Offload copies on dedicated CUDA stream | `offload.py` |
-| Clone elimination in evict | Avoids wasted CPU allocation per eviction | `offload.py` |
+Note: the extra ~560ms vs standard BERT is from the forward pass weight
+construction (`base_W + delta * (1 - nv)`) per layer, not from the hash
+computation (which is ~1ms on GPU).
 
 ---
 
@@ -177,12 +164,12 @@ All runs on BERT-base, SST-2, batch_size=16, sm_75 (GTX 1650).  May 2026.
 
 | File | Purpose |
 |------|---------|
-| `zpackr_layer.py` | ZPackRLinear — frozen base + LZ4 delta, forward/backward/post_step |
+| `zpackr_layer.py` | ZPackRLinear, DeltaSignatureDB, `compute_hash_gpu()` |
 | `config.py` | ZPackRConfig dataclass |
 | `layer_patcher.py` | `compress_model()` — nn.Linear → ZPackRLinear |
 | `prompt_gate.py` | `should_skip_backward()` — convergence gate |
-| `checkpoint.py` | `save/load_zpackr_checkpoint()` — LZ4-compressed delta on disk |
-| `super_dict.py` | Optional zstd text preprocessor (not used in training signal) |
+| `checkpoint.py` | `save/load_zpackr_checkpoint()` — zstd-compressed delta on disk |
+| `super_dict.py` | Optional zstd text preprocessor (archived) |
 | `zpackr_interface.py` | `export_model()` — merge base+delta → standard nn.Linear |
 
 ### packr package (dependency)
@@ -214,16 +201,19 @@ All runs on BERT-base, SST-2, batch_size=16, sm_75 (GTX 1650).  May 2026.
 
 ### test_zpackr_layer.py
 - Forward shape and correctness vs nn.Linear
-- post_step produces attenuation factors
-- Checkpoint roundtrip preserves delta (LZ4)
+- post_step produces attenuation factors (via compute_hash_gpu)
+- Checkpoint roundtrip preserves delta (zstd)
 - Gradient flow only to delta_salient
 
-### test_dual_signal.py (LZ4 Signal)
-- Zero-delta compresses extremely well (255x+)
-- Trained delta compresses poorly (~1.0x)
-- post_step produces attenuation from LZ4 ratios
+### test_dual_signal.py (LSH Signal)
+- LSH hash is deterministic (same seed → same hash)
+- LSH hash has correct shape [n_blocks, K]
+- Empty window gives zero attenuation
+- Attenuation increases as delta stabilizes across encounters
 - Convergence gate fires on fully-attenuated blocks
 - Gate does not fire when any block below threshold
+- Checkpoint roundtrip preserves delta state
+- ZPackRLinear has DeltaSignatureDB
 
 ### test_prompt_gate.py
 - Gate fires when all blocks attenuated
@@ -232,14 +222,15 @@ All runs on BERT-base, SST-2, batch_size=16, sm_75 (GTX 1650).  May 2026.
 - Custom threshold overrides default
 
 ### test_checkpoint.py
-- Model-level save/load roundtrip with LZ4
+- Model-level save/load roundtrip with zstd
 - Forward output preserved across checkpoint
 
 ---
 
-## Deferred (v3.1+)
+## Deferred (v4.1+)
 
 - Auto-terminating training (convergence gate skip rate threshold)
-- Per-block convergence-driven VRAM pruning (blocks that stay at 255x for N post_steps fully pruned)
-- Super Dict as optional text preprocessor for semantic whitening
-- Multi-task continual learning with attenuation as per-task signal
+- Per-block VRAM pruning (blocks that stay at 1.0 for N steps)
+- Multi-scale flatness as local minimum detector (add perturbation)
+- Higher K values (128, 256) for finer resolution
+- Cosine similarity directly (not LSH hash) for finer-grained attenuation
