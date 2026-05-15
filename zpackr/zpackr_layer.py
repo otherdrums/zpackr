@@ -268,10 +268,9 @@ class ZPackRLinear(nn.Module):
         Per-row attenuation applied via _atten_byte (uint8 → float).
         """
         orig_shape = x.shape
+        orig_dtype = x.dtype
         if x.dim() == 3:
             x = x.reshape(-1, x.shape[-1])
-
-        dev = x.device
 
         if x.dtype == torch.bfloat16:
             x_bf16 = x
@@ -284,10 +283,13 @@ class ZPackRLinear(nn.Module):
         nv = (self._atten_byte.float() / 255.0).to(torch.bfloat16).unsqueeze(1)
         W = self.base_W.to(dev) + self.delta_salient * (1.0 - nv)
 
-        out = (x_bf16 @ W).float()
-
+        out = x_bf16 @ W
         if self.bias is not None:
-            out = out + self.bias.float()
+            out = out + self.bias
+
+        # Preserve input dtype — ZPackRLinear is dtype-agnostic
+        if out.dtype != orig_dtype:
+            out = out.to(orig_dtype)
 
         if len(orig_shape) == 3:
             out = out.reshape(orig_shape[0], orig_shape[1], -1)
