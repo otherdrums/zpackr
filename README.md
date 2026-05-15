@@ -1,15 +1,18 @@
-# ZPackR — Deterministic Per-Block Delta Attenuation
+# ZPackR — Deterministic Per-Row Delta Attenuation
 
 > **Warning — Experimental.** ZPackR is in early development and not yet ready
 > for production use. APIs and training dynamics are subject to change without
 > notice. Expect breakage and iteration.
 
-Frozen BERT base + LSH-attenuated trainable delta. Per-block LSH (Locality-Sensitive
+Frozen BERT base + LSH-attenuated trainable delta. **Per-row** LSH (Locality-Sensitive
 Hashing) of delta vectors produces a cosine similarity signal across a sliding
-window — the delta's directional stability IS the convergence metric.
+window — each row's directional stability IS its convergence metric.
+
+Hash computed via custom Triton kernel (single 2D launch, no float32 intermediate).
+Attenuation stored as uint8 GPU tensor — 256 levels of resolution per row.
 
 No dictionaries, no reindex, no calibration, no compression, no historical state
-beyond a 60-step ring buffer of 64-bit hash signatures.
+beyond a 60-step ring buffer of 64-bit row hashes.
 
 ## Quick Start
 
@@ -31,7 +34,7 @@ for step, batch in enumerate(loader):
     optimizer.step()
     optimizer.zero_grad()
 
-    # LSH hash computed synchronously on GPU (~1ms total)
+    # LSH hash computed synchronously on GPU via custom Triton kernel
     for module in model.modules():
         if hasattr(module, 'compute_hash_gpu'):
             module.compute_hash_gpu()
@@ -48,21 +51,22 @@ python -m tools.diagnose --task sst2 --max-steps 8000 --batch-size 16 \
 ```
 Text → BERT forward/backward → delta on GPU
                                   │
-                    LSH hash: sign(delta @ projections.T)
+              Custom Triton kernel: sign(delta @ projections.T)
+                   2D grid (in_features × K), single launch
                                   │
          multi-scale cos_sim vs 60-step sliding window
                                   │
-            attenuation = mean_sim × (1 - flatness)
+         attenuation = mean_sim × (1 - flatness) → uint8 [0, 255]
                                   │
-             Forward: delta *= (1 - attenuation) per block
-             Gate:    if all blocks ≥ 0.99 → skip backward
+               Forward: delta *= (1 - nv/255) per row
+               Gate:    if all rows ≥ 1.0 → skip backward
 ```
 
-**Novel blocks** have changing delta direction → low mean_sim → low attenuation → train fully.
-**Converged blocks** have stable delta direction → high mean_sim, low flatness → attenuation ≈ 1.0.
-**Diverging blocks** have varying stability across time scales → high flatness → attenuation reduced.
+**Novel rows** have changing delta direction → low mean_sim → low attenuation → train fully.  
+**Converged rows** have stable delta direction → high mean_sim, low flatness → attenuation ≈ 255.  
+**Diverging rows** have varying stability across time scales → high flatness → attenuation reduced.
 
-### The zstd problem
+### The zstd problem (why we don't compress)
 
 Raw bf16 bytes from Adam-optimized deltas all compress to ~1.27x regardless of
 content (the bf16 entropy floor). No compression technique — raw, prefix dict,
@@ -74,45 +78,63 @@ random to any compressor.
 
 LSH operates on the delta VALUES (not bytes), preserving cosine similarity in
 compact bit hashes. The sign of random projections captures the delta's
-direction, which stabilizes as the block converges. Two deltas with similar
+direction, which stabilizes as the row converges. Two deltas with similar
 direction have similar hashes — 880x discrimination between converged and novel.
+
+The hash is computed by a custom Triton kernel (`_lsh_hash_kernel`) with a
+2D grid of `(in_features, K)` blocks. Each block computes one dot product
+`(delta[row] · proj[k])` and stores the sign bit. Single kernel launch replaces
+24 separate cuBLAS calls and avoids the float32 intermediate tensor.
 
 ### Per-Step Data Flow
 
 ```
-1. Forward:       delta *= (1 - attenuation) per block → combined matmul → output
+1. Forward:       delta *= (1 - attenuation/255) per row → combined matmul → output
 2. Backward:      grad flows only to delta_salient (base_W is frozen)
 3. Optimizer:     FusedQuantizedAdam updates delta_salient on GPU
-4. Hash (GPU):    LSH hash → push to sliding window → multi-scale comparison
-5. Attenuation:   mean_sim × (1 - flatness) — pure function, no thresholds
-6. Gate:          convergence check — all blocks ≥ 0.99 → skip backward
+4. Hash (GPU):    Triton kernel → sign bits → push to sliding window
+5. Attenuation:   mean_sim × (1 - flatness) → uint8 [0, 255]
+6. Gate:          convergence check — all rows ≥ 1.0 → skip backward
 ```
 
 ### Convergence Gate
 
-Checks whether ALL blocks across ALL layers have attenuation ≥
-`ATTENUATION_SKIP_THRESHOLD` (default 0.99). If so, backward is skipped.
+Checks whether ALL rows across ALL layers have attenuation ≥
+`ATTENUATION_SKIP_THRESHOLD` (default 1.0). With `min()` semantics — every
+single row must be fully converged.
 
 Hash is computed every step even when gate fires, so the window keeps evolving.
-If any block dips below threshold, the gate opens and training resumes.
+If any row dips below threshold, the gate opens and training resumes.
 
 ### Key Design Decisions
 
-**LSH over zstd/LZ4**: Compression on bf16 bytes can't distinguish known from
-novel (entropy floor). LSH on delta values gives 880x discrimination, ~1ms on
-GPU vs ~400ms CPU, with no thread complexity.
+**Row-level over block-level**: Each row of the weight matrix converges
+independently. Block-level (256 rows grouped) over-attenuated — converged rows
+drowned novel ones in the same block, capping accuracy at 92%. Row-level
+achieves 93-94% by giving each row its own convergence signal.
+
+**Triton kernel over cuBLAS**: A custom `_lsh_hash_kernel` with `(in_features, K)`
+grid computes all row projections in a single launch, avoids the float32
+intermediate (delta.float()), and writes uint8 directly. Same FMA count,
+less memory bandwidth.
+
+**uint8 attenuation over float**: 256 levels (one byte per row) exceeds the
+resolution of K=32 (32 levels) or K=64 (64 levels). Stored as `register_buffer`
+on GPU — zero `torch.tensor(list)` calls in forward, zero Python→GPU syncs.
 
 **Sliding window over prompt table**: A 60-step ring buffer of 64-bit hashes
-(~2MB) replaces the 67K-entry per-prompt table (~2.5GB). Multi-scale comparison
-(offsets 1, 5, 10, 25, 50) captures convergence at multiple time scales.
+(~22MB for 46K rows) replaces the 67K-entry per-prompt table (~2.5GB).
+Multi-scale comparison (offsets 1, 5, 10, 25, 50) captures convergence at
+multiple time scales.
 
-**Pure deterministic computation**: Attenuation is `mean_sim × (1 - flatness)`.
-No thresholds, no conditionals, no historical state beyond the ring buffer.
-Every component is a pure function of current + recent state.
+**Pure deterministic computation**: Attenuation is `mean_sim × (1 - flatness)`
+→ `(value * 255).to(torch.uint8)`. No thresholds, no conditionals, no historical
+state beyond the ring buffer. Every component is a pure function of current +
+recent state.
 
-**No pruning**: All blocks stay active on GPU, just attenuated. Pruning was
+**No pruning**: All rows stay active on GPU, just attenuated. Pruning was
 removed in v4 because the attenuation signal alone prevents overfitting without
-the complexity of managing block masks.
+the complexity of managing row masks.
 
 ## Training Harness
 
@@ -129,7 +151,7 @@ python -m tools.diagnose --task sst2 --max-steps 8000 --batch-size 16 \
 | `--eval-steps` | `20` | Eval batches per run |
 | `--velvet` / `--no-velvet` | on | VelvetController per-layer LR |
 | `--attenuation-skip` / `--no-attenuation-skip` | on | Convergence gate |
-| `--attenuation-skip-threshold` | `0.99` | Attenuation threshold for gate |
+| `--attenuation-skip-threshold` | `1.0` | Attenuation threshold for gate |
 | `--batch-size` | `16` | Per-GPU batch size |
 | `--lr` | `2e-5` | Learning rate |
 | `--label` | `""` | Prefix for output directory |
@@ -141,20 +163,20 @@ python -m tools.diagnose --task sst2 --max-steps 8000 --batch-size 16 \
 ```
 runs/my_run_2026-05-14_runid/
   metrics.jsonl         # per-step: loss, step_ms, gate_skipped, salience, vram
-  ratio_log.jsonl       # per-step per-block: attenuation, delta_l2
+  ratio_log.jsonl       # per-step per-row: attenuation, delta_l2
   config.json           # full TrainerConfig snapshot
   summary.json          # final stats: peak_vram_mb, final_eval_metric, gate_skip_rate
   checkpoints/
     step_N/
-      0.meta, 0.zstd, 0.mask, 0.base_W   # per-layer delta state
-      trainer_state.pt                    # optimizer + Velvet
+      0.meta, 0.zstd, 0.base_W   # per-layer delta state
+      trainer_state.pt            # optimizer + Velvet
 ```
 
 ## Components
 
 | Module | Purpose |
 |--------|---------|
-| `zpackr_layer.py` | ZPackRLinear, DeltaSignatureDB, `compute_hash_gpu()` |
+| `zpackr_layer.py` | ZPackRLinear, DeltaSignatureDB, `_lsh_hash_kernel` (Triton), `compute_hash_gpu()` |
 | `config.py` | ZPackRConfig dataclass |
 | `layer_patcher.py` | `compress_model()` — replaces nn.Linear with ZPackRLinear |
 | `prompt_gate.py` | `should_skip_backward()` — convergence-driven backward skip |
@@ -165,10 +187,10 @@ runs/my_run_2026-05-14_runid/
 
 | Constant | Default | Meaning |
 |----------|:-------:|---------|
-| `K` (lsh_K) | `128` | LSH hash bits (higher = finer resolution, more memory) |
+| `K` (lsh_K) | `64` | LSH hash bits (higher = finer resolution, more memory) |
 | `WINDOW_SIZE` | `60` | Sliding window of hash snapshots |
 | `LSH_OFFSETS` | `(1,5,10,25,50)` | Multi-scale comparison offsets |
-| `ATTENUATION_SKIP_THRESHOLD` | `0.99` | Gate fires when all blocks ≥ this |
+| `ATTENUATION_SKIP_THRESHOLD` | `1.0` | Gate fires when all rows ≥ this (min over rows) |
 
 ## License
 
