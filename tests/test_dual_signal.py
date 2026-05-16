@@ -228,3 +228,42 @@ class TestLSHSignal:
         mix1 = 1.0
         atten = delta_sim ** (1 - mix1) * (1 - grad_sim) ** mix1
         assert abs(atten.item() - 0.7) < 1e-6, f"Grad only: expected 0.7, got {atten.item()}"
+
+    def test_gradient_avg_exists(self):
+        """ZPackRLinear should have _gradient_avg buffer."""
+        zpl = ZPackRLinear.from_linear(torch.nn.Linear(8, 4, bias=False))
+        assert hasattr(zpl, '_gradient_avg'), "_gradient_avg should exist"
+        assert zpl._gradient_avg.shape == (8, 4)
+        assert zpl._gradient_avg.dtype == torch.bfloat16
+
+    def test_grad_hash_updates_ema(self):
+        """compute_grad_hash should update _gradient_avg via EMA."""
+        torch.manual_seed(99)
+        zpl = ZPackRLinear.from_linear(torch.nn.Linear(8, 4, bias=False))
+        if torch.cuda.is_available():
+            zpl = zpl.cuda()
+        x = torch.randn(2, 8, device=zpl.delta_salient.device, dtype=torch.bfloat16)
+
+        # First backward: _gradient_avg was zeros; after EMA it becomes (1-beta)*grad
+        y = zpl(x).sum()
+        y.backward()
+        grad_pre = zpl.delta_salient.grad.clone()  # save raw grad
+        zpl.compute_grad_hash()
+        beta = zpl._grad_ema_beta
+        expected_avg = (1.0 - beta) * grad_pre  # beta*0 + (1-beta)*grad = (1-beta)*grad
+        assert torch.allclose(zpl._gradient_avg, expected_avg, atol=1e-4), \
+            "First EMA update should be (1-beta)*grad"
+
+        # Second backward: EMA should blend old avg with new grad
+        y2 = zpl(x).sum()
+        y2.backward()
+        grad_new = zpl.delta_salient.grad.clone()
+        zpl.compute_grad_hash()
+        expected_avg2 = beta * expected_avg + (1.0 - beta) * grad_new
+        assert torch.allclose(zpl._gradient_avg, expected_avg2, atol=1e-4), \
+            "Second EMA update should blend old avg with new grad"
+
+    def test_grad_avg_default_beta(self):
+        """Default grad_ema_beta should be 0.9967."""
+        zpl = ZPackRLinear.from_linear(torch.nn.Linear(8, 4, bias=False))
+        assert abs(zpl._grad_ema_beta - 0.9967) < 1e-6

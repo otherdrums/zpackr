@@ -237,13 +237,15 @@ class ZPackRLinear(nn.Module):
     """
 
     def __init__(self, in_features, out_features, bias=True, lsh_K=16,
-                 lsh_window=4200, hash_interval=1, gradient_mix=0.5):
+                 lsh_window=4200, hash_interval=1, gradient_mix=0.5,
+                 grad_ema_beta=0.9967):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self._hash_interval = hash_interval
         self._hash_counter = 0
         self._gradient_mix = gradient_mix
+        self._grad_ema_beta = grad_ema_beta
 
         # Frozen base — stored in bf16 for direct matmul compatibility
         self.base_W = nn.Parameter(
@@ -269,6 +271,12 @@ class ZPackRLinear(nn.Module):
         self.register_buffer('_grad_sim',
             torch.zeros(in_features, dtype=torch.float32))
 
+        # EMA of the gradient — batch noise cancellation before hashing.
+        # beta=0.9967 ≈ 300-step averaging window (half-life ~208 steps).
+        # Initialized to zeros; hovers near-zero when converged (no learning signal).
+        self.register_buffer('_gradient_avg',
+            torch.zeros(in_features, out_features, dtype=torch.bfloat16))
+
         # Ratio cache for diagnostic tools
         self._ratio_cache = None
 
@@ -288,12 +296,15 @@ class ZPackRLinear(nn.Module):
 
     @torch.no_grad()
     def compute_grad_hash(self):
-        """Hash the gradient, update _grad_sim.
+        """Update gradient EMA, hash the EMA, update _grad_sim.
 
         Must be called after backward() and BEFORE optimizer.step()/zero_grad().
-        Hashes delta_salient.grad via the Triton kernel into a gradient
-        signature window, computes exponentially-weighted similarity, and
-        caches it in _grad_sim for the next compute_hash_gpu call.
+
+        Maintains an exponential moving average of the gradient (_gradient_avg)
+        to cancel batch-to-batch noise before hashing.  The EMA is hashed via
+        the Triton kernel and compared against past EMA hashes in the gradient
+        window — only the consistent, long-term gradient direction contributes
+        to the similarity signal.
 
         Safe to call when grad is None (first step, or before first backward):
         _grad_sim is left at zero (no gradient contribution to mixing).
@@ -303,7 +314,12 @@ class ZPackRLinear(nn.Module):
             self._grad_sim.zero_()
             return
 
-        current_hashes = self._grad_sig_db.hash_rows(grad)
+        # Update gradient EMA: smooth out batch noise
+        beta = self._grad_ema_beta
+        self._gradient_avg.copy_(beta * self._gradient_avg + (1.0 - beta) * grad)
+
+        # Hash the averaged gradient (not the raw grad)
+        current_hashes = self._grad_sig_db.hash_rows(self._gradient_avg)
         grad_sim = self._grad_sig_db.compute_attenuation(current_hashes)
         self._grad_sim.copy_(grad_sim)
         self._grad_sig_db.push(current_hashes)
@@ -427,6 +443,7 @@ class ZPackRLinear(nn.Module):
             "out_features": self.out_features,
             "has_bias": self.bias is not None,
             "gradient_mix": self._gradient_mix,
+            "grad_ema_beta": self._grad_ema_beta,
         }, path + ".meta")
 
         torch.save(self.base_W.data, path + ".base_W")
@@ -481,8 +498,12 @@ class ZPackRLinear(nn.Module):
         inst.register_buffer('_grad_sim',
             torch.zeros(inst.in_features, dtype=torch.float32,
                         device=inst.delta_salient.device))
+        inst.register_buffer('_gradient_avg',
+            torch.zeros(inst.in_features, inst.out_features, dtype=torch.bfloat16,
+                        device=inst.delta_salient.device))
         inst._ratio_cache = None
         inst._gradient_mix = meta.get("gradient_mix", 0.5)
+        inst._grad_ema_beta = meta.get("grad_ema_beta", 0.9967)
         inst._sig_db = DeltaSignatureDB(
             num_rows=inst.in_features,
         )
@@ -494,12 +515,14 @@ class ZPackRLinear(nn.Module):
     # ── Conversion from nn.Linear ──
 
     @classmethod
-    def from_linear(cls, module: nn.Linear, hash_interval: int = 1, gradient_mix: float = 0.5):
+    def from_linear(cls, module: nn.Linear, hash_interval: int = 1,
+                    gradient_mix: float = 0.5, grad_ema_beta: float = 0.9967):
         """Convert nn.Linear → frozen base + zero delta."""
         inst = cls(module.in_features, module.out_features,
                    bias=module.bias is not None,
                    hash_interval=hash_interval,
-                   gradient_mix=gradient_mix)
+                   gradient_mix=gradient_mix,
+                   grad_ema_beta=grad_ema_beta)
 
         w = module.weight.detach().t().contiguous()
         inst.base_W.data.copy_(w.to(torch.bfloat16))
