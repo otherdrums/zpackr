@@ -68,24 +68,27 @@
 - Different layers converge at different rates (deeper layers faster)
 - Within a layer, all rows vary independently
 
-### 10. Death spiral: attenuation eats the model alive (May 15)
+### 10. Death spiral: near offsets dominate, signal clips (May 15)
 - Observed: eval accuracy on SST-2 drops from ~0.80 to 0.5125 (random) by step 3000
-- Pattern: collapses in waves (2300, 2900), partial recovery (2600), then collapse again
-- Root cause: purely window-based attenuation creates a positive feedback loop:
+- Root cause: `mean_sim` across 7 flat-weighted offsets is dominated by near
+  offsets (1, 3) which are always ~1.0 (consecutive hashes barely change).
+  By step 25, mean attenuation hits 235/255 = 92% — effective LR drops from
+  2e-5 to 1.1e-6.  The model can't learn.
+- Signal analysis (500-step run with per-row histograms):
   ```
-  attenuated → muted gradient → delta barely changes → hash stays "stable" → more attenuation
+  Step 100 offsets:  off=1: 1.000  off=3: 0.982  off=10: 0.946
+                     off=30: 0.892  off=100: 0.510
+                     flat mean = 0.866 → atten_byte = 221 → 3.4% gradient
   ```
-- Once a row drops below ~0.5 attenuation, the death spiral is self-sustaining:
-  the hash signal can't distinguish "truly converged" from "stuck in local minimum"
-- Fix: **remove squared formula and flatness penalty**. Attenuation is now just the
-  mean cosine similarity across all window offsets (`mean_sim`). No amplification,
-  no extra signals — naturally bidirectional:
+- Fix: **exponentially weighted mean** — far offsets dominate via
+  `LSH_WEIGHTS = (1, 1, 2, 4, 8, 16, 32)` matching the log-spaced offsets:
+  ```python
+  old: mean_sim = cos_sim.mean(dim=0)                         # flat → near dominates
+  new: attenuation = Σ(cos_sim * w) / Σ(w)                     # far dominates
   ```
-  old: attenuation = (mean_sim * (1 - flatness))²   # quadratic → sticky
-  new: attenuation = mean_sim                         # linear → rises and falls freely
-  ```
-- This lets attenuation fall as the window rolls forward and the current hash
-  diverges from past hashes. A row can always recover by changing its delta.
+  For the step 100 example above:
+  `(0.95·1 + 0.89·2 + 0.51·4) / (1+2+4) = 0.70` → **30% gradient** vs 3.4%
+- Gate still works: at full convergence all offsets=1.0 → weighted mean=1.0 → byte=255
 - Attenuation ranges from ~0.0 (still learning) to 1.0 (fully converged) across rows
 - Layer 8-10 output converge fastest, layer 2-3 intermediate slowest
 

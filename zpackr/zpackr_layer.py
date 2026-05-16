@@ -37,6 +37,14 @@ ATTENUATION_SKIP_THRESHOLD = 1.0
 # Multi-scale comparison offsets (in steps) — logarithmic, 3x spacing
 LSH_OFFSETS = (1, 3, 10, 30, 100, 300, 1000)
 
+# Exponential weights for far-offset dominance.
+# Near offsets (1, 3) are always ~1.0 since consecutive hashes barely change;
+# they dominate the mean and mask the far-offset signal.  These weights
+# suppress near offsets and amplify far ones so attenuation reflects
+# true long-term convergence, not short-term direction consistency.
+# Weights grow as 2^{idx}, aligned with log-spaced offsets.
+LSH_WEIGHTS = (1, 1, 2, 4, 8, 16, 32)
+
 
 @triton.jit
 def _lsh_hash_fused_kernel(
@@ -82,12 +90,14 @@ class DeltaSignatureDB:
     against past hashes produces mean_sim and flatness signals per row.
 
     The window lives on CPU (pinned for async GPU↔CPU transfers) to save
-    ~369MB of GPU VRAM.  Only the 7 offsets needed per step (~644KB) are
-    transferred to GPU during compute_attenuation.
+    ~369MB of GPU VRAM.  Only the needed offsets (~644KB) are transferred
+    to GPU during compute_attenuation.
 
-    Attenuation = mean cosine similarity across all window offsets → uint8 [0, 255].
+    Attenuation = exponentially weighted mean of cosine similarities across
+    all valid window offsets.  Far offsets (100, 300, 1000) dominate over
+    near offsets (1, 3) via LSH_WEIGHTS = (1, 1, 2, 4, 8, 16, 32).
       - Converged + stable → ~255 (fully attenuated)
-      - Learning + varying → ~128 (partially attenuated)
+      - Learning + varying → ~64-128 (partially attenuated)
       - Novel (no history) → 0 (fully active)
     """
 
@@ -165,17 +175,24 @@ class DeltaSignatureDB:
         bit-by-bit matching (which gives K+1 levels).  With K=16 packed into
         2 bytes, effective resolution is ~512 levels per offset.
 
+        Attenuation is the exponentially weighted mean of cosine similarities
+        across valid window offsets — far offsets (100, 300, 1000) dominate
+        over near offsets (1, 3) so the signal reflects true long-term
+        convergence rather than short-term direction consistency.
+
         Returns:
             [in_features] float32 tensor, values in [0, 1]
         """
         count = self._count
 
-        # Collect valid offset indices
+        # Collect valid offset indices and their exponential weights
         indices = []
-        for off in LSH_OFFSETS:
+        weights_list = []
+        for i, off in enumerate(LSH_OFFSETS):
             if off > count:
                 break
             indices.append((self._cursor - off) % self._window_size)
+            weights_list.append(LSH_WEIGHTS[i])
 
         n_offsets = len(indices)
         if n_offsets == 0:
@@ -192,12 +209,11 @@ class DeltaSignatureDB:
         matching = byte_sim.mean(dim=2)  # [n_off, num_rows]
         cos_sim = 2 * matching - 1       # map [0,1] → [-1,1]
 
-        mean_sim = cos_sim.mean(dim=0)
+        # Exponentially weighted mean: far offsets dominate so the signal
+        # reflects long-term convergence, not short-term direction stability.
+        weights_t = torch.tensor(weights_list, device='cuda', dtype=torch.float32)
+        attenuation = (cos_sim * weights_t.unsqueeze(1)).sum(dim=0) / weights_t.sum()
 
-        # Attenuation is the mean cosine similarity across all window offsets.
-        # Naturally rises as the hash stabilizes and falls as it changes —
-        # no squaring, no flatness penalty, no separate novelty boost.
-        attenuation = mean_sim
         return torch.clamp(attenuation, 0.0, 1.0)
 
 
