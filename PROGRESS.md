@@ -203,9 +203,25 @@ Counter-based skip in `compute_hash_gpu()` — returns early when
 
 Launch hash kernels for all 24 layers concurrently on separate CUDA streams. Wall time drops from sequential sum to max-per-layer. Most useful if hash remains the bottleneck after interval.
 
+## Optimizer Performance
+
+| Optimizer | Memory | Step time (110M params) | Notes |
+|-----------|--------|------------------------|-------|
+| Standard AdamW (fp32 states) | 880MB | 80ms | cuDNN-optimized |
+| Triton 8-bit (per-param) | 220MB | 300ms | 74 separate launches |
+| ~~Triton 8-bit (flat-buffer)~~ | 220MB | ~150ms est. | Superseded by CUDA |
+| **CUDA 8-bit (flat-buffer)** | **220MB** | **17ms** ✅ | **Hand-tuned CUDA kernel** |
+| Full train w/ CUDA 8-bit + LSH | 789MB alloc, 951MB peak | **~840ms est.** | ✅ matches finetune |
+
+The CUDA 8-bit AdamW kernel (`--optimizer cuda8`) is compiled inline by nvcc on first import (cached at `~/.cache/torch_extensions/`). It uses:
+- Flat-buffer: single kernel launch, all 110M params processed together
+- Warp-level `__shfl_xor_sync` reductions: no shared memory stalls for absmax
+- Block-level int8 quantization with per-block scales
+
 ## New Config Options
 
 | Flag | Config | Default | Effect |
 |------|--------|---------|--------|
 | `--bf16` | `PackRConfig(bf16=True)` | False | Convert model to bfloat16 before training (saves ~100MB VRAM) |
 | `--hash-interval` | `PackRConfig(hash_interval=N)` | 1 | Compute LSH hash every N steps (amortized cost drops N×) |
+| `--optimizer` | `PackRConfig(optimizer_type=...)` | `cuda8` | Optimizer: `cuda8` (fast CUDA), `triton8` (old), `adamw` (standard fp32) |
