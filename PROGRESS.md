@@ -69,22 +69,19 @@
 - Different layers converge at different rates (deeper layers faster)
 - Within a layer, all rows vary independently
 
-### 10. Dual-signal mixing: delta + gradient hash (May 15)
-- Signal analysis revealed root cause of death spiral: delta-hash alone
-  can't distinguish "converged" from "stuck" — both have stable position.
-- Gradient hash measures learning signal SNR (stable gradient = learning,
-  noisy gradient = converged or stuck).
-- Together they form a complete signal via geometric product:
-  ```
-  atten = delta_sim^(1-mix) * (1-grad_sim)^mix
-  ```
-  Attenuation is only high when BOTH agree the row is done.
-- Add `_grad_sig_db` (second `DeltaSignatureDB`), `compute_grad_hash()`
-  (called after backward, before optimizer), and `--gradient-mix` CLI flag.
-- Default mix=0.5 gives ~40-60% effective gradient during learning vs
-  ~3-8% with delta-only, while still braking to ~24% at convergence.
-- Attenuation ranges from ~0.0 (still learning) to 1.0 (fully converged) across rows
-- Layer 8-10 output converge fastest, layer 2-3 intermediate slowest
+### 10. CUDA8BitAdam bf16 kernel bug: 2× amplification (May 16)
+- The "death spiral" was NOT caused by the attenuation system at all.
+- Ablation test fixed max_atten at 0.0 (pure finetune, no attenuation) also
+  collapsed to 0.506 accuracy — same pattern as attenuated runs.
+- Fuzz test: CUDA8BitAdam's bf16 path produces 2.1× larger weight updates than
+  AdamW (norm 0.065 vs 0.031 on first step, compounding to 22× over 100 steps).
+  The fp32 path is correct (diff=0.004 vs AdamW, pure 8-bit quantization noise).
+- Root cause: kernel's `is_bf16` register-shift bf16↔fp32 conversion has a bug.
+- Fix: convert bf16 params/grads to fp32 at Python level before launching kernel,
+  then copy result back to bf16. Ratio drops from 2.1× to 0.93× (8-bit quantization).
+- This explains ALL observed instability: oscillating accuracy, collapse even
+  without attenuation, and the original "death spiral" being an optimizer bug
+  that the attenuation system was masking then amplifying.
 
 ## Test Data (SST-2, no velvet)
 
