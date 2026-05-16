@@ -1,264 +1,306 @@
-# ZPackR — Block-Level System Flowchart (v4 LSH)
+# ZPackR — System Flowchart (v8, BERT-base SST-2)
 
-## 1. System Overview
-
-```
-                      ┌─────────────────────────────────────────┐
-                      │              TRAINING LOOP               │
-                      │                                         │
- Input Text ──────────▶  HuggingFace BERT forward               │
- (tokenized)           │      │                                  │
-                       │      ▼                                  │
-                       │  ZPackRLinear.forward()                 │
-                       │  x @ (base_W + delta*(1-attenuation))   │
-                       │      │                                  │
-                       │      ▼                                  │
-                       │  loss.backward()                        │
-                       │      │                                  │
-                       │      ▼                                  │
-                       │  optimizer.step()  ← FusedQuantizedAdam │
-                       │      │                                  │
-                       │      ├─ compute_hash_gpu()  every step  │
-                       │      │    LSH hash → sliding window     │
-                       │      │    multi-scale cos_sim → attn    │
-                       │      │                                  │
-                       │      ├─ convergence gate (threshold 0.99)│
-                       │      │    all blocks ≥ 0.99? → skip     │
-                       │      │                                  │
-                       │      └─ optimizer.zero_grad()           │
-                       └─────────────────────────────────────────┘
-                                      │
-                                      ▼
-                               Predictions
-```
-
-## 2. Per-Step Detail
+## 1. Training Loop Overview
 
 ```
-STEP N (every step):
+                        ┌──────────────────────────────────────────┐
+                        │             TRAINING LOOP                 │
+                        │  batch=16, seq=128, bf16 model           │
+ Input text ───────────▶│  HuggingFace BERT forward                 │
+ (tokenized)            │     │                                     │
+                        │     ▼                                     │
+                        │  ZPackRLinear.forward()                   │
+                        │  x @ (base_W + delta × (1 - atten_byte))  │
+                        │  (per-row attenuation, dtype-agnostic)     │
+                        │     │                                     │
+                        │     ▼                                     │
+                        │  loss.backward()                           │
+                        │     │                                     │
+                        │     ▼                                     │
+                        │  convergence gate (threshold = 1.0)        │
+                        │  checks _atten_byte.min() / 255            │
+                        │     │                                     │
+                        │     ├── True (all rows byte=255) → skip   │
+                        │     └── False → optimizer.step()          │
+                        │                  │                        │
+                        │                  ▼                         │
+                        │  CUDA8BitAdam | FusedQuantizedAdam        │
+                        │  8-bit int8 m/v, per-block scales         │
+                        │     │                                     │
+                        │     ▼                                     │
+                        │  compute_hash_gpu() — every step or       │
+                        │  every N steps (hash_interval config)     │
+                        │     │                                     │
+                        │     ├── fused Triton hash kernel          │
+                        │     │    1D grid (in_features,), K=16     │
+                        │     │    sign(delta × projection)         │
+                        │     │                                     │
+                        │     ├── compute_attenuation               │
+                        │     │    CPU pinned → GPU batch transfer  │
+                        │     │    continuous byte comparison        │
+                        │     │    offsets (1,3,10,30,100,300,1000) │
+                        │     │    attn = (mean_sim × (1-flat))²    │
+                        │     │                                     │
+                        │     └── push() → CPU pinned ring buffer   │
+                        │         4200 entries, async copy          │
+                        │                                          │
+                        └──────────────────────────────────────────┘
+                                       │
+                                       ▼
+                                Predictions
+```
+
+## 2. Per-Step Detail (BERT-base, ~110M FFN params, 24 ZPackRLinear)
+
+```
+STEP (hash-interval=8, non-hash step shown):
 ═══════════════════════════════════════════════════════════════════
 
   ┌──────────────────────────────────────────────────────────────┐
-  │ 1. FORWARD                                                   │
+  │ FORWARD (≈290ms GPU)                                         │
   │                                                              │
-  │   x = batch.to(device)          # [M, in_features]           │
-  │                                                              │
-  │   For each ZPackRLinear layer:                               │
-  │     if all blocks salient:                                   │
-  │       nv = tensor(attenuation_factors).repeat_interleave(256)│
-  │       W = base_W + delta_salient * (1.0 - nv)                │
-  │       out = x @ W                                            │
-  │     elif partial salience:                                   │
-  │       W = base_W.clone()                                     │
-  │       scatter attenuated delta into W via index_add_         │
-  │       out = x @ W                                            │
-  │                                                              │
-  │   loss = outputs.loss / grad_accum_steps                     │
+  │  x shape:          [16, 128, 768] bf16                       │
+  │  For each layer (×24):                                       │
+  │    nv = _atten_byte.float() / 255 → bf16 [in_f, 1]          │
+  │    W = base_W + delta_salient × (1 - nv)  ← dtype-agnostic  │
+  │    out = x @ W → then .to(orig_dtype)                        │
+  │  → base_W frozen (bf16), delta_salient trainable (bf16)     │
   └──────────────────────────────────────────────────────────────┘
                               │
                               ▼
   ┌──────────────────────────────────────────────────────────────┐
-  │ 2. CONVERGENCE GATE                                          │
+  │ CONVERGENCE GATE (≈0ms, CUDA sync = forward cost)            │
   │                                                              │
-  │   if all(layer._attenuation_factors >= 0.99                  │
-  │           for layer in zpl_layers):                          │
-  │       gate_skipped = True                                    │
-  │       → skip backward, record step                           │
-  │   else:                                                      │
-  │       gate_skipped = False                                   │
+  │  should_skip_backward():                                     │
+  │    for each ZPackRLinear (24):                               │
+  │      if _atten_byte.float().min().item() / 255 < 1.0:       │
+  │        return False   ← any row not fully converged          │
+  │    return True        ← ALL rows byte=255                    │
   │                                                              │
-  │   Hash is computed EVERY step (even on gate-skipped)         │
+  │  Gate is currently 0% — no row has hit byte=255 yet          │
   └──────────────────────────────────────────────────────────────┘
                               │ (if not skipped)
                               ▼
   ┌──────────────────────────────────────────────────────────────┐
-  │ 3. BACKWARD                                                  │
+  │ BACKWARD (≈250ms GPU)                                        │
   │                                                              │
-  │   loss.backward()                                            │
-  │   → gradients flow through attenuated delta                  │
-  │   → fully-attenuated blocks get ~0 gradient                  │
-  │   → base_W gets 0 gradient (frozen)                          │
+  │  loss.backward()                                             │
+  │  → gradient flows through delta × (1 - nv)                  │
+  │  → base_W gets 0 gradient (frozen)                           │
+  │  → delta_salient gets full gradient                          │
   └──────────────────────────────────────────────────────────────┘
                               │
                               ▼
   ┌──────────────────────────────────────────────────────────────┐
-  │ 4. OPTIMIZER + HASH                                          │
+  │ OPTIMIZER (≈129ms, includes zero_grad)                       │
   │                                                              │
-  │   optimizer.step()                                           │
-  │   → FusedQuantizedAdam updates delta_salient on GPU          │
-  │   → optimizer.zero_grad()                                    │
+  │  CUDA8BitAdam: 76 per-param kernel launches                  │
+  │    dtype-agnostic (bf16/fp32 via register shift)             │
+  │    warp-level __shfl_xor_sync reductions                     │
+  │    int8 m/v states, per-block float32 scales                  │
+  │  OR FusedQuantizedAdam (Triton 8-bit)                        │
+  │  OR standard AdamW (fp32 states)                             │
   │                                                              │
-  │   compute_hash_gpu() — every step, ~1ms total on GPU:        │
-  │     padded = F.pad(delta_salient, ...)                       │
-  │     blocks = padded.reshape(n_blocks, block_elements)        │
-  │     proj = blocks.float() @ projections_gpu.t()              │
-  │     hash = (proj > 0).to(torch.uint8)                        │
-  │     push hash → sliding window                               │
-  │     attenuation = compute_attenuation(hash)                   │
-  │     → attenuation = mean_sim * (1 - flatness)                │
+  │  Velvet (optional): read exp_avg_sq, adjust LR               │
+  └──────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+  ┌──────────────────────────────────────────────────────────────┐
+  │ HASH (≈619ms raw, ≈87ms net — overlaps with next step)       │
+  │  (runs every hash_interval steps, not every step)             │
+  │                                                              │
+  │  1. fused Triton kernel (1D grid):                           │
+  │       grid (in_features,)  — one block per row               │
+  │       each block: load delta[row] ONCE                       │
+  │       compute K=16 dot products, store K hash bits            │
+  │       16× less delta memory traffic than 2D grid             │
+  │                                                              │
+  │  2. compute_attenuation:                                     │
+  │       batch-transfer 7 past hashes from CPU pinned → GPU     │
+  │       continuous byte: 1 - |hash - stored| / 255              │
+  │       matching = byte_sim.mean(dim=1) → cos_sim = 2m - 1     │
+  │       mean_sim, variance across offsets                       │
+  │       atten = clamp((mean_sim × (1 - sqrt(var)))², 0, 1)     │
+  │       store as uint8 via in-place copy_()                    │
+  │                                                              │
+  │  3. push: async non_blocking GPU→CPU pinned copy              │
+  │                                                              │
+  │  Skip logic: when hash_counter < hash_interval, return        │
   └──────────────────────────────────────────────────────────────┘
 ```
 
----
-
-## 3. Signal Flow — LSH Hash Chain (every step, GPU)
+## 3. LSH Hash Chain (fused Triton kernel)
 
 ```
-DELTA SALIENT on GPU [in_features × out_features] bf16
-│
-│  F.pad + reshape → [num_blocks, block_size × out_features]
-│
-├── Block 0: [block_size × out_features] bf16 → flat
-├── Block 1: [block_size × out_features] bf16 → flat
-├── ...
-└── Block N-1: [block_size × out_features] bf16 → flat
-
-                    │
-                    ▼
-
-  blocks_flat.float() @ projections_gpu.t()   # GPU matmul
-  → [num_blocks, K] float32
-  → sign → [num_blocks, K] uint8 hash
-
-  projections_gpu: two shared matrices (120MB total):
-    - intermediate: [64, 256×3072] bf16  (96MB)
-    - output:       [64, 256×768]  bf16  (24MB)
-
-                    │
-                    ▼
-
-  For offsets o in (1, 5, 10, 25, 50):
-    if o ≤ len(window):
-      stored = window[-o]              # hash from o steps ago
-      matching = (hash == stored).mean(dim=1)
-      cos_sim = 2 × matching - 1
-
-  mean_sim = mean(cos_sim across offsets)
-  variance = var(cos_sim across offsets)
-  flatness = sqrt(variance)
-  attenuation = mean_sim × (1 - flatness)
-
-                    │
-                    ▼
-
-  FORWARD:  combined delta contribution = delta[i] × (1 - attenuation[i])
-            → applied per block in the cuBLAS matmul
-
-  GATE:     if all(attenuation[i] >= 0.99 for all i in all layers)
-            → should_skip_backward() = True
+DELTA SALIENT [in_features × out_features] bf16
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────┐
+│ FUSED TRITON KERNEL: _lsh_hash_fused_kernel                 │
+│                                                             │
+│ Grid: (in_features,) — 1D, one block per row               │
+│ Each block:                                                 │
+│   acc = tl.zeros([K], dtype=tl.float32)                     │
+│   for each chunk (BLOCK_OUT=256):                           │
+│     load delta[row, chunk] — ONCE                           │
+│     for k in range(K):                                      │
+│       load proj[k, chunk]                                   │
+│       acc[k] += tl.sum(delta × proj)                        │
+│                                                             │
+│   tl.store(hash_ptr + row*K + tl.arange(0,K),              │
+│            (acc > 0).to(tl.uint8))                          │
+│                                                             │
+│ PACK: [in_f, K] uint8 → [in_f, K//8] uint8                │
+│       K=16 → 2 bytes/row                                    │
+└─────────────────────────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────┐
+│ WINDOW: pinned CPU ring buffer                              │
+│  size: 4200 × total_rows × (K/8) bytes = ~0MB GPU, 369MB CPU│
+│  push: async non_blocking copy (GPU→CPU pinned)             │
+│  compute_attenuation: batch-transfer 7 offsets CPU→GPU      │
+└─────────────────────────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────┐
+│ MULTI-SCALE COMPARISON                                     │
+│  offsets: (1, 3, 10, 30, 100, 300, 1000)                   │
+│                                                             │
+│  current = current_hashes.unsqueeze(0)  [1, rows, 2]        │
+│  stored = past_hashes                [n_off, rows, 2]        │
+│  diff = (current - stored).abs()                             │
+│  byte_sim = 1 - diff / 255                                   │
+│  matching = byte_sim.mean(dim=2)   [n_off, rows]             │
+│  cos_sim = 2 × matching - 1        [n_off, rows]             │
+│                                                             │
+│  mean_sim = cos_sim.mean(dim=0)    [rows]                    │
+│  variance = cos_sim.var(dim=0)     [rows]                    │
+│  flatness = sqrt(clamp(var, 0))    [rows]                    │
+│  attenuation = clamp((mean_sim × (1 - flatness))², 0, 1)    │
+│  → _atten_byte = (atten × 255).to(uint8)                    │
+└─────────────────────────────────────────────────────────────┘
 ```
 
----
+## 4. Row State Machine
 
-## 4. Block State Machine
-
-A single block (256 × out_features) goes through these states:
+Each row (of delta_salient) goes through these states:
 
 ```
-                   ┌────────────────┐
-                   │    FRESH       │ delta = 0
-                   │    BLOCK       │ LSH hash = f(zeros)
-                   │                │ attenuation = 0.0 (no window)
-                   │   on GPU ✓     │
-                   └───────┬────────┘
-                           │ optimizer.step()
-                           │ delta becomes non-zero
-                           ▼
-                   ┌────────────────┐
-                   │   LEARNING     │ delta ≠ 0, direction changes
-                   │    BLOCK       │ LSH changes each step
-                   │                │ mean_sim < 0.9
-                   │   on GPU ✓     │ flatness > 0.05
-                   └───────┬────────┘
-                           │ delta direction stabilizes
-                           ▼
-                   ┌────────────────┐
-                   │  CONVERGING    │ delta ≠ 0, direction stable
-                   │    BLOCK       │ LSH changes slowly
-                   │                │ mean_sim 0.9-0.99
-                   │   on GPU ✓     │ flatness 0.01-0.05
-                   └───────┬────────┘
-                           │ delta very stable
-                           ▼
-                   ┌────────────────┐
-                   │  CONVERGED     │ delta stable
-                   │    BLOCK       │ LSH unchanged across window
-                   │                │ mean_sim ≈ 1.0
-                   │   on GPU ✓     │ flatness ≈ 0.0
-                   └───────┬────────┘
-                           │
-                           │ new prompt changes delta
-                           ▼
-                   ┌────────────────┐
-                   │   LEARNING     │ (cycle repeats)
-                   │    BLOCK       │
-                   └────────────────┘
+                ┌─────────────────────┐
+                │      NOVEL          │ delta = 0
+                │      ROW            │ LSH hash = f(zeros)
+                │                     │ attenuation = 0 (no window)
+                │   GPU delta ✓       │
+                └─────────┬───────────┘
+                          │ optimizer.step() → delta ≠ 0
+                          ▼
+                ┌─────────────────────┐
+                │     LEARNING        │ delta changes direction
+                │      ROW            │ LSH changes each step
+                │                     │ mean_sim < 0.9
+                │   GPU delta ✓       │ flatness > 0.05
+                └─────────┬───────────┘
+                          │ delta direction stabilizes
+                          ▼
+                ┌─────────────────────┐
+                │    CONVERGING       │ delta stable
+                │      ROW            │ LSH changes slowly
+                │                     │ mean_sim 0.9-0.99
+                │   GPU delta ✓       │ flatness 0.01-0.05
+                └─────────┬───────────┘
+                          │ delta very stable → atten → 1.0
+                          ▼
+                ┌─────────────────────┐
+                │    CONVERGED        │ delta stable
+                │      ROW            │ LSH unchanged
+                │                     │ _atten_byte = 255
+                │   GPU delta ✓       │ flatness ≈ 0
+                └─────────┬───────────┘
+                          │ new gradient changes delta
+                          ▼
+                ┌─────────────────────┐
+                │     LEARNING        │ (cycle repeats)
+                │      ROW            │
+                └─────────────────────┘
 ```
 
----
-
-## 5. Determinism Chain
+## 5. VRAM Breakdown (BERT-base, batch=16, seq=128, bf16, CUDA optimizer)
 
 ```
-Every component is a pure function:
-
-seed (42) → torch.Generator → random projections [K, block_elements]
-                                              │
-                                              ▼
-delta_salient (GPU) → F.pad → reshape → blocks_flat
-                                              │
-                                              ▼
-            blocks_flat @ projections.T → sign → hash (uint8)
-                                              │
-                                              ▼
-    hash vs window[-1], window[-5], ..., window[-50]
-    → cos_sim per offset → mean_sim, flatness → attenuation
-                                              │
-                                              ▼
-                Forward: delta × (1 - attenuation)
+┌──────────────────────────────────────────────┬───────────┐
+│ Component                                    │ Size      │
+├──────────────────────────────────────────────┼───────────┤
+│ Model weights (bf16)                         │  220 MB   │
+│   base_W (FFN, frozen, bf16)                 │  113 MB   │
+│   delta_salient (FFN, trainable, bf16)       │  113 MB   │
+│   attention / embeddings / pooler (bf16)     │  108 MB   │
+├──────────────────────────────────────────────┼───────────┤
+│ Optimizer states (int8 m/v + fp32 scales)    │  223 MB   │
+│ Gradients (bf16, freed after step)           │  220 MB   │
+│ Pinned CPU window                            │    0 MB   │
+├──────────────────────────────────────────────┼───────────┤
+│ torch.cuda.memory_allocated (steady)         │  565 MB   │
+│ torch.cuda.max_memory_allocated (peak)        │  861 MB   │
+│ nvidia-smi (includes caching allocator)      │ ~1.5 GB   │
+└──────────────────────────────────────────────┴───────────┘
 ```
 
----
-
-## 6. Convergence Gate Decision
+## 6. Determinism Chain
 
 ```
-Every training step, before backward:
+Every component is a pure function of current state:
 
-  For each ZPackRLinear layer (0..23):
-      factors = layer._attenuation_factors
-      if factors is None:
-          return False  ← no factors yet → keep training
+seed (42) → torch.Generator → random projections [K, out_features]
+    → normalized per row → cached GPU tensor (class-level)
 
-      if any(f < 0.99 for f in factors):
-          return False  ← at least one block still novel
+delta_salient (GPU bf16) → fused Triton kernel → hash bits [in_f, K]
+    → pack to [in_f, K//8] uint8
 
-  return True  ← ALL blocks across ALL layers fully attenuated
+CPU pinned window: 4200 × hashes
 
-                   │
-                   ├── True  → skip backward (gate_skipped = True)
-                   └── False → loss.backward() + optimizer.step()
+multi-scale comparison → mean_sim × flatness → attenuation²
+    → uint8 via (attn × 255).to(torch.uint8)
+    → in-place copy_() into register_buffer
 
-  Hash is still computed on gate-skipped steps (window evolves).
-  If a block dips below 0.99, gate opens on next step.
+Gate: _atten_byte.float().min().item() / 255 ≥ 1.0
+
+Checkpoint: zstd lossless roundtrip of delta bytes
 ```
-
----
 
 ## 7. Checkpoint — Save/Restore
 
 ```
 SAVE:
   for each ZPackRLinear layer:
-      delta_cpu = delta_salient.cpu()             # GPU→CPU copy
-      zstd.compress(delta_cpu bytes) → .zstd file
-      torch.save(base_W) → .base_W file
-      torch.save(block_mask) → .mask file
-      torch.save(metadata) → .meta file
+    delta_cpu = delta_salient.cpu()
+    zstd.compress(delta_cpu.view(uint8).numpy().tobytes())
+    → .zstd file
+    torch.save(base_W.data) → .base_W file
+    torch.save(metadata) → .meta file
 
 RESTORE:
-  zstd.decompress(.zstd file) → full_delta bf16
-  load base_W, block_mask
-  rebuild delta_salient from kept blocks
-  initialize fresh DeltaSignatureDB (empty window)
+  zstd.decompress(.zstd file)
+  → torch.frombuffer(...).view(bfloat16).view(in_f, out_f)
+  → delta_salient = nn.Parameter(restored)
+  load base_W from .base_W file
+  create fresh DeltaSignatureDB (empty window)
+```
+
+## 8. Optimizer Dispatch (dtype-agnostic)
+
+```
+CUDA8BitAdam.step():
+  for each param p:
+    if p.dtype == torch.bfloat16:
+      is_bf16 = 1  (kernel shifts uint16 left by 16)
+    else:
+      is_bf16 = 0  (kernel loads float directly)
+
+    CUDA kernel: bf16_to_float via __uint_as_float(p_u << 16)
+                 compute AdamW with int8 dequant/requant
+                 float_to_bf16 via __float_as_uint(pn) >> 16
+
+  Prebuilt: packr._adam_8bit_cuda (from setup.py CUDAExtension)
+  Fallback: torch.utils.cpp_extension.load_inline (JIT nvcc)
 ```
