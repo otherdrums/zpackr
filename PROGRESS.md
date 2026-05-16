@@ -14,7 +14,8 @@
 | v4 (LSH, May 14-15) | LSH multi-scale sliding window | GPU synchronous (~1ms) | Per-block ring buffer (60 steps) | **Superseded** — block-level caps accuracy |
 | v5 (Row LSH, May 15) | Per-row LSH + Triton kernel + uint8 + log-spaced offsets | GPU Triton kernel (K=32) | Per-row ring buffer (1100 steps) | **Superseded** |
 | v6 (CPU Window, May 15) | CPU-pinned window + batched GPU compute + optional bf16 | GPU Triton kernel (K=16) | Per-row CPU ring buffer (4200 steps) | **Superseded** |
-| v7 (Fused Hash, May 15) | Fused 1D hash kernel + hash interval + dtype-agnostic forward | GPU Triton (1D grid, K=16 fused) | Per-row CPU ring buffer (4200 steps) | **Current** |
+| v7 (Fused Hash, May 15) | Fused 1D hash kernel + hash interval + dtype-agnostic forward | GPU Triton (1D grid, K=16 fused) | Per-row CPU ring buffer (4200 steps) | **Superseded** |
+| v8 (CUDA Optimizer, May 15) | Dtype-agnostic CUDA 8-bit AdamW + bf16-native kernel | GPU CUDA + GPU Triton hash | Per-row CPU ring buffer (4200 steps) | **Current** |
 
 ## Key Findings
 
@@ -139,19 +140,19 @@ Every component is a pure function of current state:
 - DataLoader: `torch.manual_seed(seed)` — fixed shuffle order
 - Async CPU push: `non_blocking=True` copy has full step (~1.3s) to complete before read
 
-## Per-Step Timing (metrics.jsonl, with fused kernel)
+## Per-Step Timing (metrics.jsonl, v8 CUDA optimizer)
 
 Per-component timers in every step record (fields prefixed with `t_`, ms):
 
-| Field | What it measures | Current (v6) |
-|-------|-----------------|--------------|
-| `t_forward` | Python forward launch overhead | ~33ms |
-| `t_gate` | CUDA sync — captures actual **forward** GPU time | ~289ms |
-| `t_backward` | backward GPU execution | ~311ms |
-| `t_optimizer` | optimizer.step + zero_grad | ~235ms |
-| `t_hash` | **fused hash kernel** + attenuation × 24 layers | ~?ms (TBD with fused) |
-| `t_ratio_log` | _log_ratios overhead | ~3ms |
-| `step_ms` | total step wall time | ~?ms (TBD with fused) |
+| Field | What it measures | v8 (no-hash step) | v8 (hash step) |
+|-------|-----------------|-------------------|----------------|
+| `t_forward` | Python forward launch overhead | 25ms | 25ms |
+| `t_gate` | CUDA sync — captures **forward** GPU time | 290ms | 290ms |
+| `t_backward` | backward GPU execution | 250ms | 250ms |
+| `t_optimizer` | optimizer.step + zero_grad | **129ms** | **129ms** |
+| `t_hash` | fused hash kernel + attenuation × 24 | 0ms | 619ms |
+| `t_ratio_log` | _log_ratios overhead | 3ms | 3ms |
+| `step_ms` | total step wall time | **~1236ms** | **~1326ms** |
 
 To view:
 ```bash
@@ -205,23 +206,39 @@ Launch hash kernels for all 24 layers concurrently on separate CUDA streams. Wal
 
 ## Optimizer Performance
 
-| Optimizer | Memory | Step time (110M params) | Notes |
-|-----------|--------|------------------------|-------|
-| Standard AdamW (fp32 states) | 880MB | 80ms | cuDNN-optimized |
-| Triton 8-bit (per-param) | 220MB | 300ms | 74 separate launches |
-| ~~Triton 8-bit (flat-buffer)~~ | 220MB | ~150ms est. | Superseded by CUDA |
-| **CUDA 8-bit (flat-buffer)** | **220MB** | **17ms** ✅ | **Hand-tuned CUDA kernel** |
-| Full train w/ CUDA 8-bit + LSH | 789MB alloc, 951MB peak | **~840ms est.** | ✅ matches finetune |
+| Optimizer | Memory | Step time (110M params) | Dtype support | Notes |
+|-----------|--------|------------------------|---------------|-------|
+| Standard AdamW (fp32 states) | 880MB | 80ms | fp32/bf16 | cuDNN-optimized |
+| Triton 8-bit (per-param) | 220MB | 300ms | fp32/bf16 | 74 separate launches |
+| **CUDA 8-bit (per-param)** | **220MB** | **~38ms** | **fp32 + bf16** ✅ | **Hand-tuned CUDA** |
+| Full train w/ CUDA 8-bit + LSH | 565MB alloc, 861MB peak | **~1240ms** | fp32 + bf16 | ✅ matches finetune |
 
 The CUDA 8-bit AdamW kernel (`--optimizer cuda8`) is compiled inline by nvcc on first import (cached at `~/.cache/torch_extensions/`). It uses:
-- Flat-buffer: single kernel launch, all 110M params processed together
+- **Dtype-agnostic**: kernel accepts `void*` pointers, branches on `is_bf16` flag.
+  - bf16: inline bit-shift (`(uint)p_u << 16`) for register-level conversion
+  - fp32: direct float load/store
 - Warp-level `__shfl_xor_sync` reductions: no shared memory stalls for absmax
 - Block-level int8 quantization with per-block scales
+- Per-param launch (76 launches × ~0.5ms = ~38ms total)
+
+## Optimizer is Dtype-Agnostic
+
+The CUDA 8-bit AdamW kernel (`packr/packr/cuda_adam.py`) handles both fp32 and bf16
+params/grads without any conversion.  The `--bf16` flag is purely for VRAM savings on
+model weights — the optimizer works identically either way.
+
+```python
+# fp32 model (no --bf16): kernel loads float values directly
+p = torch.randn(N, dtype=torch.float32, device='cuda')  # works
+
+# bf16 model (--bf16): kernel interprets raw bytes as bf16 via shift
+p = torch.randn(N, dtype=torch.bfloat16, device='cuda')  # works
+```
 
 ## New Config Options
 
 | Flag | Config | Default | Effect |
 |------|--------|---------|--------|
-| `--bf16` | `PackRConfig(bf16=True)` | False | Convert model to bfloat16 before training (saves ~100MB VRAM) |
+| `--bf16` | `PackRConfig(bf16=True)` | False | Convert model to bfloat16 before training (saves ~60MB VRAM) |
 | `--hash-interval` | `PackRConfig(hash_interval=N)` | 1 | Compute LSH hash every N steps (amortized cost drops N×) |
-| `--optimizer` | `PackRConfig(optimizer_type=...)` | `cuda8` | Optimizer: `cuda8` (fast CUDA), `triton8` (old), `adamw` (standard fp32) |
+| `--optimizer` | `PackRConfig(optimizer_type=...)` | `cuda8` | Optimizer: `cuda8` (fast CUDA, any dtype), `triton8` (Triton 8-bit), `adamw` (standard fp32) |

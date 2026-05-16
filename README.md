@@ -19,14 +19,15 @@ beyond a 4200-step ring buffer of packed LSH hashes (2 bytes/row).
 ```python
 from transformers import AutoModelForSequenceClassification
 from zpackr import compress_model, ZPackRConfig
-from packr.optim import FusedQuantizedAdam
+from packr.cuda_adam import CUDA8BitAdam
 
-config = ZPackRConfig(layer_scope="ffn", bf16=True)  # bf16 saves ~100MB VRAM
+config = ZPackRConfig(layer_scope="ffn", bf16=True, hash_interval=4)
 model = AutoModelForSequenceClassification.from_pretrained("bert-base-uncased", num_labels=2)
 model = compress_model(model, config)
-
 model.cuda()
-optimizer = FusedQuantizedAdam(model.parameters(), lr=2e-5)
+
+# Dtype-agnostic optimizer: handles bf16 or fp32 automatically
+optimizer = CUDA8BitAdam(model.parameters(), lr=2e-5)
 
 for step, batch in enumerate(loader):
     loss = model(**batch).loss
@@ -34,7 +35,6 @@ for step, batch in enumerate(loader):
     optimizer.step()
     optimizer.zero_grad()
 
-    # LSH hash computed synchronously on GPU via custom Triton kernel
     for module in model.modules():
         if hasattr(module, 'compute_hash_gpu'):
             module.compute_hash_gpu()
@@ -42,8 +42,13 @@ for step, batch in enumerate(loader):
 
 Or the harness:
 ```bash
+# Full quality with VRAM savings (bf16 model + CUDA 8-bit optimizer)
 python -m tools.diagnose --task sst2 --max-steps 8000 --batch-size 16 \
-    --eval-interval 500 --no-velvet --bf16 --label my_run
+    --eval-interval 500 --no-velvet --bf16 --hash-interval 4 --optimizer cuda8 --label my_run
+
+# FP32 model (no VRAM savings, same optimizer speed)
+python -m tools.diagnose --task sst2 --max-steps 8000 --batch-size 16 \
+    --eval-interval 500 --no-velvet --hash-interval 4 --optimizer cuda8 --label my_run
 ```
 
 ## Architecture
