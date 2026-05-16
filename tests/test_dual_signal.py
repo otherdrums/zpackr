@@ -16,7 +16,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from packr.zpackr_layer import ZPackRLinear, DeltaSignatureDB
+from packr.zpackr_layer import ZPackRLinear, DeltaSignatureDB, ATTENUATION_SKIP_THRESHOLD
 from packr.prompt_gate import should_skip_backward
 
 
@@ -151,3 +151,47 @@ class TestLSHSignal:
         assert hasattr(zpl, '_sig_db'), "_sig_db should exist"
         assert isinstance(zpl._sig_db, DeltaSignatureDB)
         assert zpl._sig_db.num_rows == 64
+
+    def test_novelty_boost_lowers_attenuation_for_changing_rows(self):
+        """Rows with changing hashes should have lower attenuation than stable rows."""
+        torch.manual_seed(42)
+        in_f, out_f = 64, 32
+        lin = torch.nn.Linear(in_f, out_f, bias=False)
+        lin.weight.data = torch.randn(out_f, in_f)
+
+        # Stable run: same delta every step
+        zpl_s = ZPackRLinear.from_linear(lin)
+        if torch.cuda.is_available():
+            zpl_s = zpl_s.cuda()
+        zpl_s.delta_salient.data += 0.1
+        zpl_s.post_step()
+        zpl_s.post_step()
+        zpl_s.post_step()
+        stable_atten = zpl_s._atten_byte.float().mean().item()
+
+        # Changing run: new random direction each step (+= in-place on same device)
+        zpl_c = ZPackRLinear.from_linear(lin)
+        if torch.cuda.is_available():
+            zpl_c = zpl_c.cuda()
+        dev = zpl_c.delta_salient.device
+        zpl_c.delta_salient.data += 0.1
+        zpl_c.post_step()
+        zpl_c.delta_salient.data += torch.randn(in_f, out_f, device=dev, dtype=torch.bfloat16) * 0.5
+        zpl_c.post_step()
+        zpl_c.delta_salient.data += torch.randn(in_f, out_f, device=dev, dtype=torch.bfloat16) * 0.5
+        zpl_c.post_step()
+        changing_atten = zpl_c._atten_byte.float().mean().item()
+
+        assert changing_atten < stable_atten, (
+            f"Changing rows ({changing_atten:.4f}) should have lower attenuation "
+            f"than stable rows ({stable_atten:.4f})"
+        )
+
+    def test_prev_hashes_initialized_after_first_post_step(self):
+        """_prev_hashes should be set after first post_step call."""
+        torch.manual_seed(42)
+        zpl = ZPackRLinear.from_linear(torch.nn.Linear(64, 32, bias=False))
+        assert zpl._prev_hashes is None, "_prev_hashes should start as None"
+        zpl.post_step()
+        assert zpl._prev_hashes is not None, "_prev_hashes should be set after first post_step"
+        assert zpl._prev_hashes.shape == (64, 2), "Shape should match [in_features, K//8]"

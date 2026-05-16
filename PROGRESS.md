@@ -67,6 +67,27 @@
 ### 9. Per-block variation is real
 - Different layers converge at different rates (deeper layers faster)
 - Within a layer, all rows vary independently
+
+### 10. Death spiral: attenuation eats the model alive (May 15)
+- Observed: eval accuracy on SST-2 drops from ~0.80 to 0.5125 (random) by step 3000
+- Pattern: collapses in waves (2300, 2900), partial recovery (2600), then collapse again
+- Root cause: purely window-based attenuation creates a positive feedback loop:
+  ```
+  attenuated → muted gradient → delta barely changes → hash stays "stable" → more attenuation
+  ```
+- Once a row drops below ~0.5 attenuation, the death spiral is self-sustaining:
+  the hash signal can't distinguish "truly converged" from "stuck in local minimum"
+- Fix: **novelty boost** — compare current hash to previous step's hash, and if bits
+  changed, the row is still learning → discount the window-based attenuation:
+  ```
+  novelty = popcount(hash ^ prev_hash) / K    # fraction of bits that flipped
+  attenuation *= (1.0 - novelty)               # less attenuation = more delta contribution
+  ```
+  When novelty = 0 (perfectly stable hash): uses window value as-is
+  When novelty = 0.5 (half bits flipped): attenuation is halved
+  When novelty = 1.0 (all bits flipped): attenuation = 0 (row fully active)
+- This creates a NEGATIVE feedback loop: changing hash → less attenuation → more gradient → more hash change
+- Test `test_novelty_boost_lowers_attenuation_for_changing_rows` validates the behavior
 - Attenuation ranges from ~0.0 (still learning) to 1.0 (fully converged) across rows
 - Layer 8-10 output converge fastest, layer 2-3 intermediate slowest
 
