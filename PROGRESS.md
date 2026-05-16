@@ -77,17 +77,15 @@
   ```
 - Once a row drops below ~0.5 attenuation, the death spiral is self-sustaining:
   the hash signal can't distinguish "truly converged" from "stuck in local minimum"
-- Fix: **novelty boost** — compare current hash to previous step's hash, and if bits
-  changed, the row is still learning → discount the window-based attenuation:
+- Fix: **remove squared formula and flatness penalty**. Attenuation is now just the
+  mean cosine similarity across all window offsets (`mean_sim`). No amplification,
+  no extra signals — naturally bidirectional:
   ```
-  novelty = popcount(hash ^ prev_hash) / K    # fraction of bits that flipped
-  attenuation *= (1.0 - novelty)               # less attenuation = more delta contribution
+  old: attenuation = (mean_sim * (1 - flatness))²   # quadratic → sticky
+  new: attenuation = mean_sim                         # linear → rises and falls freely
   ```
-  When novelty = 0 (perfectly stable hash): uses window value as-is
-  When novelty = 0.5 (half bits flipped): attenuation is halved
-  When novelty = 1.0 (all bits flipped): attenuation = 0 (row fully active)
-- This creates a NEGATIVE feedback loop: changing hash → less attenuation → more gradient → more hash change
-- Test `test_novelty_boost_lowers_attenuation_for_changing_rows` validates the behavior
+- This lets attenuation fall as the window rolls forward and the current hash
+  diverges from past hashes. A row can always recover by changing its delta.
 - Attenuation ranges from ~0.0 (still learning) to 1.0 (fully converged) across rows
 - Layer 8-10 output converge fastest, layer 2-3 intermediate slowest
 

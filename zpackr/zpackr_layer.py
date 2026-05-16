@@ -85,9 +85,9 @@ class DeltaSignatureDB:
     ~369MB of GPU VRAM.  Only the 7 offsets needed per step (~644KB) are
     transferred to GPU during compute_attenuation.
 
-    Attenuation = mean_sim * (1 - flatness) → uint8 [0, 255].
+    Attenuation = mean cosine similarity across all window offsets → uint8 [0, 255].
       - Converged + stable → ~255 (fully attenuated)
-      - Learning + varying → ~204 (partially attenuated)
+      - Learning + varying → ~128 (partially attenuated)
       - Novel (no history) → 0 (fully active)
     """
 
@@ -193,11 +193,11 @@ class DeltaSignatureDB:
         cos_sim = 2 * matching - 1       # map [0,1] → [-1,1]
 
         mean_sim = cos_sim.mean(dim=0)
-        variance = cos_sim.var(dim=0, unbiased=False)
-        flatness = torch.sqrt(torch.clamp(variance, min=0.0))
 
-        # Squared attenuation: compresses distribution, delays convergence to 255
-        attenuation = (mean_sim * (1.0 - flatness)) ** 2
+        # Attenuation is the mean cosine similarity across all window offsets.
+        # Naturally rises as the hash stabilizes and falls as it changes —
+        # no squaring, no flatness penalty, no separate novelty boost.
+        attenuation = mean_sim
         return torch.clamp(attenuation, 0.0, 1.0)
 
 
@@ -238,10 +238,6 @@ class ZPackRLinear(nn.Module):
         self.register_buffer('_atten_byte',
             torch.zeros(in_features, dtype=torch.uint8))
 
-        # Previous-step hashes for novelty boost.
-        # None on first call, then [in_features, bytes_per_hash] uint8 on GPU.
-        self._prev_hashes = None
-
         # Ratio cache for diagnostic tools
         self._ratio_cache = None
 
@@ -275,25 +271,6 @@ class ZPackRLinear(nn.Module):
 
         # Compute attenuation BEFORE pushing current hash to window
         attenuation = self._sig_db.compute_attenuation(current_hashes)
-
-        # Novelty boost: if hash changed from previous step, this row is still
-        # learning — discount the window-based attenuation so the row stays
-        # active.  Breaks the death spiral where attenuated rows stop receiving
-        # gradients and their hash appears falsely stable.
-        if self._prev_hashes is not None:
-            diff = current_hashes ^ self._prev_hashes  # XOR — differing bits
-            # Popcount across all packed bytes (K=16 → 2 bytes × 8 bits)
-            bits_set = torch.zeros(self.in_features, dtype=torch.float32, device='cuda')
-            for b in range(self._sig_db.bytes_per_hash):
-                byte = diff[:, b]
-                for i in range(8):
-                    bits_set += ((byte >> i) & 1).float()
-            novelty = bits_set / self._sig_db.K  # [0, 1]
-            # Discount: higher novelty → lower attenuation → more delta contribution
-            attenuation = attenuation * (1.0 - novelty)
-            self._prev_hashes.copy_(current_hashes)
-        else:
-            self._prev_hashes = current_hashes.clone()
 
         # Push current hash into window after computing attenuation
         self._sig_db.push(current_hashes)
@@ -435,7 +412,6 @@ class ZPackRLinear(nn.Module):
             torch.zeros(inst.in_features, dtype=torch.uint8,
                         device=inst.delta_salient.device))
         inst._ratio_cache = None
-        inst._prev_hashes = None
         inst._sig_db = DeltaSignatureDB(
             num_rows=inst.in_features,
         )
