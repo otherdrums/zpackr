@@ -70,18 +70,22 @@
 - Within a layer, all rows vary independently
 
 ### 10. CUDA8BitAdam bf16 kernel bug: 2× amplification (May 16)
-- The "death spiral" was NOT caused by the attenuation system at all.
-- Ablation test fixed max_atten at 0.0 (pure finetune, no attenuation) also
-  collapsed to 0.506 accuracy — same pattern as attenuated runs.
-- Fuzz test: CUDA8BitAdam's bf16 path produces 2.1× larger weight updates than
-  AdamW (norm 0.065 vs 0.031 on first step, compounding to 22× over 100 steps).
-  The fp32 path is correct (diff=0.004 vs AdamW, pure 8-bit quantization noise).
-- Root cause: kernel's `is_bf16` register-shift bf16↔fp32 conversion has a bug.
-- Fix: convert bf16 params/grads to fp32 at Python level before launching kernel,
-  then copy result back to bf16. Ratio drops from 2.1× to 0.93× (8-bit quantization).
-- This explains ALL observed instability: oscillating accuracy, collapse even
-  without attenuation, and the original "death spiral" being an optimizer bug
-  that the attenuation system was masking then amplifying.
+- The "death spiral" was NOT caused by the attenuation system.
+- Ablation test with max_atten=0.0 (pure finetune, no attenuation) also
+  collapsed to 0.506 — same pattern. The optimizer was broken.
+- Fuzz test: CUDA8BitAdam's is_bf16=1 kernel path produces 2.25× larger
+  weight updates than AdamW (ratio 2.25, cosim 0.30 on step 1, diverging
+  to 10× over 50 steps). fp32 path (is_bf16=0) is correct (ratio 1.0,
+  cosim 1.0).
+- Root cause: unknown — register-shift bf16↔fp32 logic is mathematically
+  correct but the kernel produces wrong results on sm_75 (Turing).
+- Fix: for bf16 params, copy param+grad into pre-allocated fp32 workspace,
+  launch kernel with is_bf16=0 (correct fp32 path), copy result back.
+  Pre-allocated workspace means no O(step) memory churn.
+- Fuzz test confirms fix: bf16 ratio=0.999x, cosim>0.993, max_abs_diff<5e-4
+- All previous death spiral analysis (weighted offsets, gradient mixing,
+  EMA, novelty boost) was tuned on a broken training system and is invalid.
+  Re-run ablation to establish correct baseline.
 
 ## Test Data (SST-2, no velvet)
 
