@@ -1,21 +1,19 @@
-"""ZPackRLinear — frozen base + row-level LSH-attenuated trainable delta.
+"""ZPackRLinear — frozen base + row-level dual-signal LSH-attenuated delta.
 
-Drop-in replacement for nn.Linear that stores a frozen base weight plus
-a trainable delta.  Per-row attenuation prevents overfitting by suppressing
-delta contribution for rows the model has already converged on.
+Uses TWO LSH signals per row:
+  - delta hash:  direction stability of the delta weight (position convergence)
+  - gradient hash: direction stability of the gradient (learning signal SNR)
+
+Attenuation is a geometric mix of both:
+  atten = delta_sim ** (1 - mix) * (1 - grad_sim) ** mix
+
+Delta alone can't distinguish "converged" from "stuck" (both have stable
+positions).  Gradient alone can't distinguish "learning" from "converged"
+(converged gradient is noise = unstable).  Together they form a complete
+signal: attenuation rises only when BOTH agree the row is done.
 
 Forward:  output = x @ (base_W + delta * (1 - attenuation))
              └─ frozen ─┘   └─ trainable ─┘
-
-The attenuation signal comes from DeltaSignatureDB: a sliding window of
-LSH hashes of each row's delta.  Multi-scale comparison (vs 1, 5, 10,
-25, 50 steps ago) produces two signals per row:
-  - mean_sim: average cosine similarity across scales (convergence level)
-  - flatness: std of cosine similarity across scales (stability)
-  - attenuation = mean_sim * (1 - flatness) → quantized to uint8 (256 levels)
-
-Hash computed via custom Triton kernel — no float32 intermediate, single launch.
-Attenuation stored as uint8 GPU tensor — 256 levels > K=32 or K=64 resolution.
 """
 
 import math
@@ -85,9 +83,13 @@ def _lsh_hash_fused_kernel(
 class DeltaSignatureDB:
     """Sliding window of LSH hashes for per-row convergence detection.
 
-    Each step, all delta rows are LSH-hashed via Triton kernel and appended
-    to a ring buffer stored in pinned CPU memory.  Multi-scale comparison
-    against past hashes produces mean_sim and flatness signals per row.
+    Each step, all delta (or gradient) rows are LSH-hashed via Triton kernel and
+    appended to a ring buffer stored in pinned CPU memory.  Multi-scale comparison
+    against past hashes produces the weighted mean of cosine similarities.
+
+    Used TWICE per ZPackRLinear: one instance for delta hashes (position stability)
+    and one for gradient hashes (learning signal SNR).  The two signals are mixed
+    geometrically into the final attenuation.
 
     The window lives on CPU (pinned for async GPU↔CPU transfers) to save
     ~369MB of GPU VRAM.  Only the needed offsets (~644KB) are transferred
@@ -218,21 +220,30 @@ class DeltaSignatureDB:
 
 
 class ZPackRLinear(nn.Module):
-    """Linear layer with frozen base + per-row LSH-attenuated trainable delta.
+    """Linear layer with frozen base + dual-signal LSH-attenuated trainable delta.
+
+    Uses TWO DeltaSignatureDB instances:
+      - _sig_db:         delta hashes (weight position stability)
+      - _grad_sig_db:    gradient hashes (learning signal SNR)
+
+    Attenuation = delta_sim ** (1 - gradient_mix) * (1 - grad_sim) ** gradient_mix
+    Both must agree the row is done for full attenuation (byte=255).
 
     GPU/VRAM:
-        base_W:           torch.Tensor [in, out] bf16    frozen pretrained weight
-        delta_salient:    torch.Tensor [kept, out] bf16   trainable delta (all rows)
-        _atten_byte:      torch.Tensor [in] uint8         per-row attenuation (0-255)
-        bias:             torch.Tensor [out] bf16 (optional)
+        base_W:           torch.Tensor [in, out] bf16   frozen pretrained weight
+        delta_salient:    torch.Tensor [in, out] bf16    trainable delta
+        _atten_byte:      torch.Tensor [in] uint8        per-row attenuation (0-255)
+        _grad_sim:        torch.Tensor [in] float32      cached gradient similarity
     """
 
-    def __init__(self, in_features, out_features, bias=True, lsh_K=16, lsh_window=4200, hash_interval=1):
+    def __init__(self, in_features, out_features, bias=True, lsh_K=16,
+                 lsh_window=4200, hash_interval=1, gradient_mix=0.5):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self._hash_interval = hash_interval
         self._hash_counter = 0
+        self._gradient_mix = gradient_mix
 
         # Frozen base — stored in bf16 for direct matmul compatibility
         self.base_W = nn.Parameter(
@@ -254,44 +265,83 @@ class ZPackRLinear(nn.Module):
         self.register_buffer('_atten_byte',
             torch.zeros(in_features, dtype=torch.uint8))
 
+        # Cached gradient similarity for mixing (updated by compute_grad_hash)
+        self.register_buffer('_grad_sim',
+            torch.zeros(in_features, dtype=torch.float32))
+
         # Ratio cache for diagnostic tools
         self._ratio_cache = None
 
-        # Per-layer LSH signature database (sliding window + multi-scale comparison)
+        # Delta signature database (position stability)
         self._sig_db = DeltaSignatureDB(
             num_rows=in_features,
             K=lsh_K,
             window_size=lsh_window,
         )
 
+        # Gradient signature database (learning signal SNR)
+        self._grad_sig_db = DeltaSignatureDB(
+            num_rows=in_features,
+            K=lsh_K,
+            window_size=lsh_window,
+        )
+
+    @torch.no_grad()
+    def compute_grad_hash(self):
+        """Hash the gradient, update _grad_sim.
+
+        Must be called after backward() and BEFORE optimizer.step()/zero_grad().
+        Hashes delta_salient.grad via the Triton kernel into a gradient
+        signature window, computes exponentially-weighted similarity, and
+        caches it in _grad_sim for the next compute_hash_gpu call.
+
+        Safe to call when grad is None (first step, or before first backward):
+        _grad_sim is left at zero (no gradient contribution to mixing).
+        """
+        grad = self.delta_salient.grad
+        if grad is None:
+            self._grad_sim.zero_()
+            return
+
+        current_hashes = self._grad_sig_db.hash_rows(grad)
+        grad_sim = self._grad_sig_db.compute_attenuation(current_hashes)
+        self._grad_sim.copy_(grad_sim)
+        self._grad_sig_db.push(current_hashes)
+
     @torch.no_grad()
     def compute_hash_gpu(self):
-        """Compute LSH hash via Triton kernel, update per-row attenuation.
+        """Compute delta LSH hash, mix with cached gradient signal, update atten.
 
-        Called after optimizer.step().  Uses shared GPU projection matrices
-        and the custom Triton _lsh_hash_fused_kernel — no float32 intermediate,
-        no separate cuBLAS launch.
+        Called after optimizer.step().  Delta hashing runs at hash_interval
+        (gradient hashing runs every step via compute_grad_hash).
 
-        When hash_interval > 1, the hash + attenuation computation is only
-        performed every N steps.  On skipped steps the current attenuation
-        is reused — this is safe because the convergence signal changes
-        slowly (multi-scale offsets span 1-1000 steps).
+        The final attenuation is a geometric mix:
+          atten = delta_sim ** (1 - mix) * (1 - grad_sim) ** mix
+
+        Where:
+          - delta_sim = weighted mean of delta cosine similarities (position)
+          - grad_sim  = weighted mean of gradient cosine similarities (SNR)
+          - mix       = gradient_mix knob (0 = pure delta, 1 = pure gradient)
+
+        When delta hash is skipped (hash_interval > 1), the mixed attenuation
+        from the last interval step is reused — the cached grad_sim still
+        evolves every step via compute_grad_hash but the delta component
+        only updates at interval boundaries.
         """
         self._hash_counter += 1
         if self._hash_counter < self._hash_interval:
             return
         self._hash_counter = 0
 
-        # LSH hash all rows via Triton kernel
+        # Delta hash — position stability signal
         current_hashes = self._sig_db.hash_rows(self.delta_salient)
-
-        # Compute attenuation BEFORE pushing current hash to window
-        attenuation = self._sig_db.compute_attenuation(current_hashes)
-
-        # Push current hash into window after computing attenuation
+        delta_sim = self._sig_db.compute_attenuation(current_hashes)
         self._sig_db.push(current_hashes)
 
-        # Update attenuation in-place — avoids buffer replacement churn
+        # Geometric mix: both signals must agree the row is done
+        mix = self._gradient_mix
+        attenuation = delta_sim.pow(1.0 - mix) * (1.0 - self._grad_sim).pow(mix)
+
         self._atten_byte.copy_((attenuation * 255).to(dtype=torch.uint8))
         self._ratio_cache = None
 
@@ -331,11 +381,11 @@ class ZPackRLinear(nn.Module):
             out = out.reshape(orig_shape[0], orig_shape[1], -1)
         return out
 
-    # ── post_step — compute hash and update attenuation ──
+    # ── post_step — compute delta hash and update attenuation ──
 
     @torch.no_grad()
     def post_step(self, threshold: float = None, calibration_multiplier: float = 0.01):
-        """Update attenuation factors from GPU hash."""
+        """Update attenuation factors from delta hash + cached gradient signal."""
         self.compute_hash_gpu()
 
     def get_block_ratios(self):
@@ -376,6 +426,7 @@ class ZPackRLinear(nn.Module):
             "in_features": self.in_features,
             "out_features": self.out_features,
             "has_bias": self.bias is not None,
+            "gradient_mix": self._gradient_mix,
         }, path + ".meta")
 
         torch.save(self.base_W.data, path + ".base_W")
@@ -427,8 +478,15 @@ class ZPackRLinear(nn.Module):
         inst.register_buffer('_atten_byte',
             torch.zeros(inst.in_features, dtype=torch.uint8,
                         device=inst.delta_salient.device))
+        inst.register_buffer('_grad_sim',
+            torch.zeros(inst.in_features, dtype=torch.float32,
+                        device=inst.delta_salient.device))
         inst._ratio_cache = None
+        inst._gradient_mix = meta.get("gradient_mix", 0.5)
         inst._sig_db = DeltaSignatureDB(
+            num_rows=inst.in_features,
+        )
+        inst._grad_sig_db = DeltaSignatureDB(
             num_rows=inst.in_features,
         )
         return inst
@@ -436,11 +494,12 @@ class ZPackRLinear(nn.Module):
     # ── Conversion from nn.Linear ──
 
     @classmethod
-    def from_linear(cls, module: nn.Linear, hash_interval: int = 1):
+    def from_linear(cls, module: nn.Linear, hash_interval: int = 1, gradient_mix: float = 0.5):
         """Convert nn.Linear → frozen base + zero delta."""
         inst = cls(module.in_features, module.out_features,
                    bias=module.bias is not None,
-                   hash_interval=hash_interval)
+                   hash_interval=hash_interval,
+                   gradient_mix=gradient_mix)
 
         w = module.weight.detach().t().contiguous()
         inst.base_W.data.copy_(w.to(torch.bfloat16))

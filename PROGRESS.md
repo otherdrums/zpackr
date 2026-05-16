@@ -15,7 +15,8 @@
 | v5 (Row LSH, May 15) | Per-row LSH + Triton kernel + uint8 + log-spaced offsets | GPU Triton kernel (K=32) | Per-row ring buffer (1100 steps) | **Superseded** |
 | v6 (CPU Window, May 15) | CPU-pinned window + batched GPU compute + optional bf16 | GPU Triton kernel (K=16) | Per-row CPU ring buffer (4200 steps) | **Superseded** |
 | v7 (Fused Hash, May 15) | Fused 1D hash kernel + hash interval + dtype-agnostic forward | GPU Triton (1D grid, K=16 fused) | Per-row CPU ring buffer (4200 steps) | **Superseded** |
-| v8 (CUDA Optimizer, May 15) | Dtype-agnostic CUDA 8-bit AdamW + bf16-native kernel | GPU CUDA + GPU Triton hash | Per-row CPU ring buffer (4200 steps) | **Current** |
+| v8 (CUDA Optimizer, May 15) | Dtype-agnostic CUDA 8-bit AdamW + bf16-native kernel | GPU CUDA + GPU Triton hash | Per-row CPU ring buffer (4200 steps) | **Superseded** |
+| v9 (Dual-Signal, May 15) | Delta + gradient LSH mixing + exponential weights | GPU Triton hash × 2 + GPU CUDA | Dual CPU ring buffers (4200 steps) | **Current** |
 
 ## Key Findings
 
@@ -68,27 +69,20 @@
 - Different layers converge at different rates (deeper layers faster)
 - Within a layer, all rows vary independently
 
-### 10. Death spiral: near offsets dominate, signal clips (May 15)
-- Observed: eval accuracy on SST-2 drops from ~0.80 to 0.5125 (random) by step 3000
-- Root cause: `mean_sim` across 7 flat-weighted offsets is dominated by near
-  offsets (1, 3) which are always ~1.0 (consecutive hashes barely change).
-  By step 25, mean attenuation hits 235/255 = 92% — effective LR drops from
-  2e-5 to 1.1e-6.  The model can't learn.
-- Signal analysis (500-step run with per-row histograms):
+### 10. Dual-signal mixing: delta + gradient hash (May 15)
+- Signal analysis revealed root cause of death spiral: delta-hash alone
+  can't distinguish "converged" from "stuck" — both have stable position.
+- Gradient hash measures learning signal SNR (stable gradient = learning,
+  noisy gradient = converged or stuck).
+- Together they form a complete signal via geometric product:
   ```
-  Step 100 offsets:  off=1: 1.000  off=3: 0.982  off=10: 0.946
-                     off=30: 0.892  off=100: 0.510
-                     flat mean = 0.866 → atten_byte = 221 → 3.4% gradient
+  atten = delta_sim^(1-mix) * (1-grad_sim)^mix
   ```
-- Fix: **exponentially weighted mean** — far offsets dominate via
-  `LSH_WEIGHTS = (1, 1, 2, 4, 8, 16, 32)` matching the log-spaced offsets:
-  ```python
-  old: mean_sim = cos_sim.mean(dim=0)                         # flat → near dominates
-  new: attenuation = Σ(cos_sim * w) / Σ(w)                     # far dominates
-  ```
-  For the step 100 example above:
-  `(0.95·1 + 0.89·2 + 0.51·4) / (1+2+4) = 0.70` → **30% gradient** vs 3.4%
-- Gate still works: at full convergence all offsets=1.0 → weighted mean=1.0 → byte=255
+  Attenuation is only high when BOTH agree the row is done.
+- Add `_grad_sig_db` (second `DeltaSignatureDB`), `compute_grad_hash()`
+  (called after backward, before optimizer), and `--gradient-mix` CLI flag.
+- Default mix=0.5 gives ~40-60% effective gradient during learning vs
+  ~3-8% with delta-only, while still braking to ~24% at convergence.
 - Attenuation ranges from ~0.0 (still learning) to 1.0 (fully converged) across rows
 - Layer 8-10 output converge fastest, layer 2-3 intermediate slowest
 

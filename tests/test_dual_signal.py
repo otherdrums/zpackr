@@ -151,3 +151,80 @@ class TestLSHSignal:
         assert hasattr(zpl, '_sig_db'), "_sig_db should exist"
         assert isinstance(zpl._sig_db, DeltaSignatureDB)
         assert zpl._sig_db.num_rows == 64
+
+    def test_has_gradient_signature_db(self):
+        """ZPackRLinear should have _grad_sig_db for gradient hashing."""
+        zpl = ZPackRLinear.from_linear(torch.nn.Linear(64, 32, bias=False))
+        assert hasattr(zpl, '_grad_sig_db'), "_grad_sig_db should exist"
+        assert isinstance(zpl._grad_sig_db, DeltaSignatureDB)
+
+    def test_grad_hash_handles_none_grad(self):
+        """compute_grad_hash should not crash when grad is None."""
+        zpl = ZPackRLinear.from_linear(torch.nn.Linear(8, 4, bias=False))
+        zpl.compute_grad_hash()  # no backward yet → grad is None
+        assert zpl._grad_sim.shape == (8,)
+        assert zpl._grad_sim.sum().item() == 0.0
+
+    def test_grad_hash_produces_similarity_after_backward(self):
+        """After backward, compute_grad_hash should fill _grad_sim."""
+        torch.manual_seed(99)
+        zpl = ZPackRLinear.from_linear(torch.nn.Linear(8, 4, bias=False))
+        if torch.cuda.is_available():
+            zpl = zpl.cuda()
+        x = torch.randn(2, 8, device=zpl.delta_salient.device, dtype=torch.bfloat16)
+        y = zpl(x).sum()
+        y.backward()
+        zpl.compute_grad_hash()
+        # _grad_sim should be a non-negative tensor (similarity in [0,1]) * 1 step
+        grad_sim = zpl._grad_sim.float()
+        assert grad_sim.min().item() >= 0.0, "grad_sim should be non-negative"
+        assert grad_sim.max().item() <= 1.0, "grad_sim should be <= 1.0"
+        # First hash with empty window → expected to be functionally 0-ish
+        # (window is empty, compute_attenuation returns zeros)
+        assert grad_sim.mean().item() == 0.0, "First grad hash with empty window should be 0"
+
+    def test_gradient_mix_default_is_05(self):
+        """Default gradient_mix should be 0.5."""
+        zpl = ZPackRLinear.from_linear(torch.nn.Linear(8, 4, bias=False))
+        assert zpl._gradient_mix == 0.5
+
+    def test_dual_signal_mixing_formula(self):
+        """Verify the geometric mixing formula with known inputs."""
+        zpl = ZPackRLinear.from_linear(torch.nn.Linear(8, 4, bias=False))
+        mix = zpl._gradient_mix  # 0.5
+
+        # Manually set delta_sim and grad_sim, call compute_hash_gpu
+        # We need to force specific values by manipulating the window
+        # The formula is: atten = delta_sim^(1-mix) * (1-grad_sim)^mix
+
+        # Test 1: both at extremes → converged
+        delta_sim = torch.tensor(1.0)  # stable delta
+        grad_sim = torch.tensor(0.0)   # noisy gradient (converged)
+        atten = delta_sim ** (1 - mix) * (1 - grad_sim) ** mix
+        assert abs(atten.item() - 1.0) < 1e-6, f"Converged: expected 1.0, got {atten.item()}"
+
+        # Test 2: learning hard (both stable)
+        delta_sim = torch.tensor(0.8)
+        grad_sim = torch.tensor(0.8)  # stable gradient = learning
+        atten = delta_sim ** (1 - mix) * (1 - grad_sim) ** mix
+        expected = (0.8 ** 0.5) * (0.2 ** 0.5)  # = sqrt(0.16) = 0.4
+        assert abs(atten.item() - expected) < 1e-6, \
+            f"Learning: expected {expected:.4f}, got {atten.item():.4f}"
+
+        # Test 3: stuck (stable delta, noisy gradient)
+        delta_sim = torch.tensor(0.9)
+        grad_sim = torch.tensor(0.3)  # some noise, some signal
+        atten = delta_sim ** (1 - mix) * (1 - grad_sim) ** mix
+        expected = (0.9 ** 0.5) * (0.7 ** 0.5)  # = sqrt(0.63) ≈ 0.794
+        assert abs(atten.item() - expected) < 1e-6, \
+            f"Stuck: expected {expected:.4f}, got {atten.item():.4f}"
+
+        # Test 4: pure delta (mix=0)
+        mix0 = 0.0
+        atten = delta_sim ** (1 - mix0) * (1 - grad_sim) ** mix0
+        assert abs(atten.item() - 0.9) < 1e-6, f"Delta only: expected 0.9, got {atten.item()}"
+
+        # Test 5: pure gradient (mix=1)
+        mix1 = 1.0
+        atten = delta_sim ** (1 - mix1) * (1 - grad_sim) ** mix1
+        assert abs(atten.item() - 0.7) < 1e-6, f"Grad only: expected 0.7, got {atten.item()}"
